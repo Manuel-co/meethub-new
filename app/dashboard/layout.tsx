@@ -3,29 +3,30 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
-import { CalendarPlus, Clock, ExternalLink, History, LayoutGrid, LogOut } from "lucide-react";
+import { CalendarPlus, Clock, ExternalLink, History, LayoutGrid, LogOut, Settings } from "lucide-react";
 import Logo from "@/components/app/Logo";
-import Avatar from "@/components/app/Avatar";
-import { logOut, useCurrentUser, useHydrated } from "@/lib/store";
+import ProfileAvatar from "@/components/app/ProfileAvatar";
+import { logOut, useAuth } from "@/lib/store";
 
 const nav = [
   { href: "/dashboard", label: "Overview", icon: LayoutGrid },
   { href: "/dashboard/schedule", label: "Schedule", icon: CalendarPlus },
   { href: "/dashboard/availability", label: "Availability", icon: Clock },
   { href: "/dashboard/history", label: "History", icon: History },
+  { href: "/dashboard/settings", label: "Settings", icon: Settings },
 ];
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
-  const hydrated = useHydrated();
-  const user = useCurrentUser();
+  const { ready, user } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
 
+  // Only redirect once Supabase has told us whether someone is signed in
   useEffect(() => {
-    if (hydrated && !user) router.replace("/login");
-  }, [hydrated, user, router]);
+    if (ready && !user) router.replace("/login");
+  }, [ready, user, router]);
 
-  if (!hydrated || !user) {
+  if (!ready || !user) {
     return (
       <div className="flex min-h-[100svh] w-full items-center justify-center text-sm text-stone">
         Loading…
@@ -75,7 +76,9 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
         </nav>
 
         <div className="mt-auto hidden items-center gap-3 rounded-2xl bg-white p-3 md:flex">
-          <Avatar name={user.name} />
+          <Link href="/dashboard/settings" aria-label="Edit your avatar" className="shrink-0">
+            <ProfileAvatar name={user.name} avatar={user.avatar} size={36} />
+          </Link>
           <div className="min-w-0 flex-1">
             <p className="truncate text-sm font-medium">{user.name}</p>
             <p className="truncate text-xs text-stone">{user.email}</p>

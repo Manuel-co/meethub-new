@@ -3,11 +3,13 @@
 import { useState } from "react";
 import { ArrowUpRight, Check, Copy } from "lucide-react";
 import CopyButton from "@/components/app/CopyButton";
-import { updateUser, useCurrentUser, type DayHours } from "@/lib/store";
+import SelectField from "@/components/app/SelectField";
+import { updateProfile, useCurrentUser, type DayHours } from "@/lib/store";
 import { DURATIONS, WEEKDAYS, timeOptions, toMinutes } from "@/lib/scheduling";
-import { fmtDuration, fmtHHMM, timeZone } from "@/lib/format";
+import { fmtDuration, fmtHHMM } from "@/lib/format";
+import { browserTimeZone, tzLabel } from "@/lib/tz";
 
-const TIMES = timeOptions(30);
+const TIME_OPTIONS = timeOptions(30).map((t) => ({ value: t, label: fmtHHMM(t) }));
 // Show Monday first
 const ORDER = [1, 2, 3, 4, 5, 6, 0];
 
@@ -17,7 +19,11 @@ export default function AvailabilityPage() {
   const [meetingLength, setMeetingLength] = useState(user.meetingLength);
   const [bookingTitle, setBookingTitle] = useState(user.bookingTitle);
   const [bookingMessage, setBookingMessage] = useState(user.bookingMessage);
+  const [timezone, setTimezone] = useState(user.timezone);
   const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const deviceTz = browserTimeZone();
 
   const invalidDays = hours
     .map((h, i) => (h.enabled && toMinutes(h.end) <= toMinutes(h.start) ? i : -1))
@@ -28,7 +34,8 @@ export default function AvailabilityPage() {
     JSON.stringify(hours) !== JSON.stringify(user.availability) ||
     meetingLength !== user.meetingLength ||
     bookingTitle !== user.bookingTitle ||
-    bookingMessage !== user.bookingMessage;
+    bookingMessage !== user.bookingMessage ||
+    timezone !== user.timezone;
 
   function setDay(i: number, patch: Partial<DayHours>) {
     setSaved(false);
@@ -40,14 +47,19 @@ export default function AvailabilityPage() {
     setHours((h) => h.map((d, j) => (j >= 1 && j <= 5 ? { ...h[i], enabled: true } : d)));
   }
 
-  function onSave() {
+  async function onSave() {
     if (invalidDays.length) return;
-    updateUser(user.id, {
+    setSaving(true);
+    setSaveError("");
+    const res = await updateProfile({
       availability: hours,
       meetingLength,
       bookingTitle: bookingTitle.trim() || "Meeting",
       bookingMessage: bookingMessage.trim(),
+      timezone,
     });
+    setSaving(false);
+    if (!res.ok) return setSaveError(`Couldn't save: ${res.error}`);
     setSaved(true);
   }
 
@@ -69,8 +81,28 @@ export default function AvailabilityPage() {
         <section className="panel flex flex-col p-2 sm:p-4 lg:col-span-7">
           <div className="flex items-baseline justify-between px-3 pb-2 pt-3">
             <h2 className="text-xl tracking-[-0.02em]">Weekly hours</h2>
-            <span className="text-xs text-stone">{timeZone()}</span>
+            <span className="text-xs text-stone" title={timezone}>
+              {tzLabel(timezone)} time
+            </span>
           </div>
+          {timezone !== deviceTz && (
+            <div className="mx-3 mb-2 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-paper px-3 py-2 text-xs">
+              <span>
+                These hours are in <strong className="font-medium">{timezone}</strong>, but this device is in{" "}
+                {deviceTz}.
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setSaved(false);
+                  setTimezone(deviceTz);
+                }}
+                className="underline underline-offset-4 hover:text-clay"
+              >
+                Use {tzLabel(deviceTz)}
+              </button>
+            </div>
+          )}
           <ul>
             {ORDER.map((i) => {
               const d = hours[i];
@@ -93,27 +125,22 @@ export default function AvailabilityPage() {
 
                   {d.enabled ? (
                     <div className="flex flex-1 flex-wrap items-center gap-2">
-                      <select
-                        aria-label={`${WEEKDAYS[i]} start`}
-                        className="field !w-auto !py-2"
+                      <SelectField
+                        ariaLabel={`${WEEKDAYS[i]} start`}
+                        className="w-32!"
                         value={d.start}
-                        onChange={(e) => setDay(i, { start: e.target.value })}
-                      >
-                        {TIMES.map((t) => (
-                          <option key={t} value={t}>{fmtHHMM(t)}</option>
-                        ))}
-                      </select>
+                        onChange={(v) => setDay(i, { start: v })}
+                        options={TIME_OPTIONS}
+                      />
                       <span className="text-stone">–</span>
-                      <select
-                        aria-label={`${WEEKDAYS[i]} end`}
-                        className={`field !w-auto !py-2 ${bad ? "!border-clay" : ""}`}
+                      <SelectField
+                        ariaLabel={`${WEEKDAYS[i]} end`}
+                        className="w-32!"
+                        invalid={bad}
                         value={d.end}
-                        onChange={(e) => setDay(i, { end: e.target.value })}
-                      >
-                        {TIMES.map((t) => (
-                          <option key={t} value={t}>{fmtHHMM(t)}</option>
-                        ))}
-                      </select>
+                        onChange={(v) => setDay(i, { end: v })}
+                        options={TIME_OPTIONS}
+                      />
                       <button
                         type="button"
                         onClick={() => copyToWeekdays(i)}
@@ -210,8 +237,10 @@ export default function AvailabilityPage() {
       {/* Sticky save bar */}
       <div className="fixed inset-x-0 bottom-0 z-20 border-t border-line bg-paper/90 backdrop-blur md:left-64">
         <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3 sm:px-8 lg:px-12">
-          <p className="text-sm text-stone">
-            {noneEnabled
+          <p className={`text-sm ${saveError ? "text-ink" : "text-stone"}`}>
+            {saveError
+              ? saveError
+              : noneEnabled
               ? "No days enabled — nobody can book you."
               : saved
                 ? "All changes saved."
@@ -221,11 +250,11 @@ export default function AvailabilityPage() {
           </p>
           <button
             onClick={onSave}
-            disabled={!dirty || invalidDays.length > 0}
+            disabled={!dirty || saving || invalidDays.length > 0}
             className="pill bg-ink px-5 py-3 text-paper hover:bg-clay hover:text-ink disabled:pointer-events-none disabled:opacity-40"
           >
             {saved && !dirty ? <Check size={13} /> : null}
-            Save changes
+            {saving ? "Saving…" : "Save changes"}
           </button>
         </div>
       </div>

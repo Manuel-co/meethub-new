@@ -4,6 +4,8 @@ import Link from "next/link";
 import { useMemo, useState } from "react";
 import { ArrowUpRight, CalendarPlus, Clock, Link2, Mail, Users, Video, X } from "lucide-react";
 import Avatar from "@/components/app/Avatar";
+import AddToCalendar from "@/components/app/AddToCalendar";
+import { meetingUrl } from "@/lib/calendar";
 import CopyButton from "@/components/app/CopyButton";
 import { useNow } from "@/components/app/useNow";
 import { cancelMeeting, useCurrentUser, useMyMeetings, type Meeting } from "@/lib/store";
@@ -18,7 +20,7 @@ function greeting(d: Date) {
 
 export default function DashboardPage() {
   const user = useCurrentUser()!; // guarded by layout
-  const all = useMyMeetings(user);
+  const all = useMyMeetings();
   const now = useNow();
   const [showPast, setShowPast] = useState(false);
 
@@ -44,7 +46,10 @@ export default function DashboardPage() {
   const bookingUrl = `${window.location.origin}/book/${user.username}`;
 
   function onCancel(m: Meeting) {
-    if (window.confirm(`Cancel "${m.title}"?`)) cancelMeeting(m.id);
+    if (!window.confirm(`Cancel "${m.title}"?`)) return;
+    cancelMeeting(m.id).then((res) => {
+      if (!res.ok) window.alert(`Couldn't cancel the meeting: ${res.error}`);
+    });
   }
 
   return (
@@ -269,6 +274,18 @@ function MeetingRow({
               <X size={13} /> Cancel
             </button>
           )}
+          <AddToCalendar
+            align="right"
+            className="pill bg-paper text-ink hover:bg-lime"
+            event={{
+              id: m.id,
+              title: m.title,
+              description: m.description,
+              start,
+              duration: m.duration,
+              url: meetingUrl(m.id),
+            }}
+          />
           <Link
             href={`/meet/${m.id}`}
             className={`pill ${live ? "bg-clay text-ink hover:bg-ink hover:text-paper" : "bg-paper text-ink hover:bg-lime"}`}

@@ -3,22 +3,21 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { ArrowRight, Eye, EyeOff, Loader2, Sparkles } from "lucide-react";
-import { logIn, signUp, suggestUsername, useCurrentUser, useDb } from "@/lib/store";
-import { logInAsDemo } from "@/lib/demo";
+import { ArrowRight, Eye, EyeOff, Loader2, MailCheck } from "lucide-react";
+import { logIn, signUp, useAuth } from "@/lib/store";
 
 export default function AuthForm({ mode }: { mode: "login" | "signup" }) {
   const router = useRouter();
-  const user = useCurrentUser();
-  const db = useDb();
+  const { user, configError } = useAuth();
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
+  const [checkEmail, setCheckEmail] = useState(false);
 
-  // Already signed in? Skip straight to the app.
+  // Signed in (now or already)? Go to the app.
   useEffect(() => {
     if (user) router.replace("/dashboard");
   }, [user, router]);
@@ -29,17 +28,35 @@ export default function AuthForm({ mode }: { mode: "login" | "signup" }) {
     e.preventDefault();
     setError("");
     setPending(true);
-    const res = isSignup
-      ? await signUp({ name, email, password })
-      : await logIn(email, password);
-    setPending(false);
-    if (!res.ok) setError(res.error);
-    // success: the effect above redirects once the session updates
+    if (isSignup) {
+      const res = await signUp({ name, email, password });
+      setPending(false);
+      if (!res.ok) return setError(res.error);
+      if (res.data.needsConfirmation) setCheckEmail(true);
+      // otherwise the session arrives and the effect above redirects
+    } else {
+      const res = await logIn(email, password);
+      setPending(false);
+      if (!res.ok) setError(res.error);
+    }
   }
 
-  async function onDemo() {
-    setPending(true);
-    await logInAsDemo();
+  if (checkEmail) {
+    return (
+      <div className="flex flex-col items-start gap-5">
+        <span className="flex h-12 w-12 items-center justify-center rounded-full bg-lime">
+          <MailCheck size={22} />
+        </span>
+        <h1 className="display text-[2.6rem]">Check your email</h1>
+        <p className="text-[15px] text-stone">
+          We sent a confirmation link to <span className="text-ink">{email.trim()}</span>. Click it, then
+          come back and log in.
+        </p>
+        <Link href="/login" className="pill bg-ink px-5 py-3 text-paper hover:bg-clay hover:text-ink">
+          Go to log in
+        </Link>
+      </div>
+    );
   }
 
   return (
@@ -55,6 +72,12 @@ export default function AuthForm({ mode }: { mode: "login" | "signup" }) {
         </p>
       </div>
 
+      {configError && (
+        <p role="alert" className="rounded-lg bg-clay/20 px-3 py-2 text-sm">
+          {configError}
+        </p>
+      )}
+
       <form onSubmit={onSubmit} className="flex flex-col gap-4" noValidate>
         {isSignup && (
           <div>
@@ -68,11 +91,7 @@ export default function AuthForm({ mode }: { mode: "login" | "signup" }) {
               onChange={(e) => setName(e.target.value)}
               required
             />
-            {name.trim().length > 1 && (
-              <p className="mt-1.5 text-xs text-stone">
-                Your booking link: <span className="text-ink">/book/{suggestUsername(name, db.users)}</span>
-              </p>
-            )}
+            <p className="mt-1.5 text-xs text-stone">Your booking link is made from your name.</p>
           </div>
         )}
 
@@ -122,7 +141,7 @@ export default function AuthForm({ mode }: { mode: "login" | "signup" }) {
 
         <button
           type="submit"
-          disabled={pending}
+          disabled={pending || Boolean(configError)}
           className="pill mt-2 justify-center bg-ink py-3.5 text-paper hover:bg-clay hover:text-ink disabled:opacity-60"
         >
           {pending ? <Loader2 size={14} className="animate-spin" /> : null}
@@ -130,19 +149,6 @@ export default function AuthForm({ mode }: { mode: "login" | "signup" }) {
           {!pending && <ArrowRight size={14} />}
         </button>
       </form>
-
-      <div className="flex items-center gap-3 text-xs text-stone">
-        <span className="h-px flex-1 bg-line" /> or <span className="h-px flex-1 bg-line" />
-      </div>
-
-      <button
-        type="button"
-        onClick={onDemo}
-        disabled={pending}
-        className="pill justify-center bg-white py-3.5 text-ink hover:bg-lime disabled:opacity-60"
-      >
-        <Sparkles size={14} /> Explore with a demo account
-      </button>
 
       <p className="text-center text-sm text-stone">
         {isSignup ? "Already have an account? " : "New to MeetHub? "}

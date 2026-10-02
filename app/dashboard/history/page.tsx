@@ -5,7 +5,14 @@ import { useEffect, useMemo, useState } from "react";
 import { Download, MessageSquare, Play, Trash2, Video, X } from "lucide-react";
 import Avatar from "@/components/app/Avatar";
 import { useNow } from "@/components/app/useNow";
-import { useCurrentUser, useMyMeetings, type Meeting } from "@/lib/store";
+import {
+  loadMeetingExtras,
+  useCurrentUser,
+  useMyMeetings,
+  type Attendance,
+  type ChatMessage,
+  type Meeting,
+} from "@/lib/store";
 import {
   deleteRecording,
   fmtBytes,
@@ -20,12 +27,34 @@ type Filter = "all" | "attended" | "recorded";
 
 export default function HistoryPage() {
   const user = useCurrentUser()!;
-  const meetings = useMyMeetings(user);
+  const meetings = useMyMeetings();
   const { recordings, error } = useRecordings(user.id);
   const now = useNow(60_000);
   const [filter, setFilter] = useState<Filter>("all");
   const [playing, setPlaying] = useState<Recording | null>(null);
   const [openChat, setOpenChat] = useState<string | null>(null);
+  const [extras, setExtras] = useState<{ messages: ChatMessage[]; attendance: Attendance[] }>({
+    messages: [],
+    attendance: [],
+  });
+
+  // Chat transcripts + attendance for meetings that have started
+  const startedIds = meetings
+    .filter((m) => m.status === "scheduled" && new Date(m.start) <= now)
+    .map((m) => m.id)
+    .join(",");
+  useEffect(() => {
+    let cancelled = false;
+    loadMeetingExtras(startedIds ? startedIds.split(",") : [])
+      .then((x) => !cancelled && setExtras(x))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [startedIds]);
+
+  const attendance = (m: Meeting) => attendanceFor(extras.attendance, m, user.id, now);
+  const attendedBy = (m: Meeting) => !!attendance(m);
 
   const byMeeting = useMemo(() => {
     const map = new Map<string, Recording[]>();
@@ -39,13 +68,14 @@ export default function HistoryPage() {
       .filter((m) => m.status === "scheduled")
       .filter((m) => {
         const end = new Date(m.start).getTime() + m.duration * 60_000;
-        return end <= now.getTime() || attendedBy(m, user.id) || byMeeting.has(m.id);
+        const joined = extras.attendance.some((a) => a.meetingId === m.id && a.userId === user.id);
+        return end <= now.getTime() || joined || byMeeting.has(m.id);
       })
       .sort((a, b) => +new Date(b.start) - +new Date(a.start));
-  }, [meetings, now, user.id, byMeeting]);
+  }, [meetings, now, user.id, byMeeting, extras.attendance]);
 
   const shown = past.filter((m) =>
-    filter === "attended" ? attendedBy(m, user.id) : filter === "recorded" ? byMeeting.has(m.id) : true,
+    filter === "attended" ? attendedBy(m) : filter === "recorded" ? byMeeting.has(m.id) : true,
   );
 
   const groups = useMemo(() => {
@@ -86,7 +116,7 @@ export default function HistoryPage() {
 
       <section className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <Stat label="Past meetings" value={past.length} tone="bg-white" />
-        <Stat label="Attended" value={past.filter((m) => attendedBy(m, user.id)).length} tone="bg-sage" />
+        <Stat label="Attended" value={past.filter((m) => attendedBy(m)).length} tone="bg-sage" />
         <Stat
           label={`Recordings${totalSize ? ` · ${fmtBytes(totalSize)}` : ""}`}
           value={recordings?.length ?? "–"}
@@ -116,8 +146,8 @@ export default function HistoryPage() {
               <ul className="flex flex-col gap-2">
                 {list.map((m) => {
                   const recs = byMeeting.get(m.id) ?? [];
-                  const mine = attendance(m, user.id);
-                  const chat = m.chat ?? [];
+                  const mine = attendance(m);
+                  const chat = extras.messages.filter((c) => c.meetingId === m.id);
                   return (
                     <li key={m.id} className="panel flex flex-col gap-4 p-5">
                       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:gap-6">
@@ -164,12 +194,12 @@ export default function HistoryPage() {
                         <div className="flex max-h-72 flex-col gap-2 overflow-y-auto rounded-xl bg-paper p-4">
                           {chat.map((c) => (
                             <div key={c.id} className="flex gap-2 text-sm">
-                              <Avatar name={c.name} size={24} />
+                              <Avatar name={c.senderName} size={24} />
                               <div className="min-w-0">
                                 <span className="text-xs text-stone">
-                                  {c.name} · {fmtTime(new Date(c.at))}
+                                  {c.senderName} · {fmtTime(new Date(c.sentAt))}
                                 </span>
-                                <p className="whitespace-pre-wrap break-words">{c.text}</p>
+                                <p className="whitespace-pre-wrap break-words">{c.body}</p>
                               </div>
                             </div>
                           ))}
@@ -219,17 +249,19 @@ export default function HistoryPage() {
   );
 }
 
-function attendance(m: Meeting, userId: string) {
-  const mine = (m.attendance ?? []).filter((a) => a.userId === userId);
+/** How long `userId` spent in meeting `m`, or null if they never joined */
+function attendanceFor(all: Attendance[], m: Meeting, userId: string, now: Date) {
+  const mine = all.filter((a) => a.meetingId === m.id && a.userId === userId);
   if (!mine.length) return null;
-  const ms = mine.reduce(
-    (n, a) => n + (new Date(a.leftAt ?? a.seenAt).getTime() - new Date(a.joinedAt).getTime()),
-    0,
-  );
+  // If the tab closed before "left" was saved, assume they stayed until the end
+  const meetingEnd = Math.min(now.getTime(), new Date(m.start).getTime() + m.duration * 60_000);
+  const ms = mine.reduce((n, a) => {
+    const joined = new Date(a.joinedAt).getTime();
+    const left = a.leftAt ? new Date(a.leftAt).getTime() : Math.max(joined, meetingEnd);
+    return n + (left - joined);
+  }, 0);
   return { minutes: Math.round(ms / 60_000) };
 }
-
-const attendedBy = (m: Meeting, userId: string) => !!attendance(m, userId);
 
 function Stat({ label, value, tone }: { label: string; value: number | string; tone: string }) {
   return (

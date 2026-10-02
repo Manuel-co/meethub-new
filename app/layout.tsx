@@ -19,8 +19,13 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${hanken.variable} h-full antialiased`}>
-      <body className="min-h-full flex flex-col bg-paper text-ink">
+    <html
+      lang="en"
+      className={`${hanken.variable} h-full antialiased`}
+      data-scroll-behavior="smooth"
+    >
+      {/* browser extensions (e.g. ColorZilla) add attributes to <body> before React loads */}
+      <body className="min-h-full flex flex-col bg-paper text-ink" suppressHydrationWarning>
         {children}
       </body>
     </html>

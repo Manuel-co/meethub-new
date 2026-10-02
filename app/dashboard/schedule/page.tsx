@@ -3,8 +3,11 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { AlertTriangle, Check, Clock, X } from "lucide-react";
+import AddToCalendar from "@/components/app/AddToCalendar";
+import CopyButton from "@/components/app/CopyButton";
+import { meetingUrl } from "@/lib/calendar";
 import { createMeeting, useCurrentUser, useMeetings, type Meeting } from "@/lib/store";
-import { DURATIONS, findConflict, getSlots } from "@/lib/scheduling";
+import { DURATIONS, busyFromMeetings, findConflict, getSlots } from "@/lib/scheduling";
 import {
   addDays,
   dayLabel,
@@ -35,11 +38,21 @@ export default function SchedulePage() {
   const start = date && time ? fromInputs(date, time) : null;
   const conflict = start ? findConflict(meetings, start, duration) : null;
 
+  const [saving, setSaving] = useState(false);
+
+  // Suggestions from your weekly hours (in your profile's timezone), shown on this device's clock
   const freeSlots = useMemo(() => {
     if (!date) return [];
-    // Use the user's weekly hours as a guide for suggestions
-    return getSlots(user, fromInputs(date, "00:00"), meetings, duration);
-  }, [user, date, meetings, duration]);
+    const from = fromInputs(date, "00:00");
+    return getSlots({
+      availability: user.availability,
+      timezone: user.timezone,
+      busy: busyFromMeetings(meetings),
+      duration,
+      from,
+      to: addDays(from, 1),
+    });
+  }, [user.availability, user.timezone, date, meetings, duration]);
 
   function addInvitee(raw: string) {
     const emails = raw
@@ -56,7 +69,7 @@ export default function SchedulePage() {
     setInviteDraft("");
   }
 
-  function onSubmit(e: React.FormEvent) {
+  async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!title.trim()) return setError("Give your meeting a title.");
     if (!start) return setError("Pick a date and time.");
@@ -70,17 +83,17 @@ export default function SchedulePage() {
       list = [...new Set([...invitees, extra])];
     }
 
-    setCreated(
-      createMeeting({
-        hostId: user.id,
-        title: title.trim(),
-        description: description.trim(),
-        start: start.toISOString(),
-        duration,
-        invitees: list,
-        source: "manual",
-      }),
-    );
+    setSaving(true);
+    const res = await createMeeting({
+      title: title.trim(),
+      description: description.trim(),
+      start: start.toISOString(),
+      duration,
+      invitees: list,
+    });
+    setSaving(false);
+    if (!res.ok) return setError(`Couldn't save the meeting: ${res.error}`);
+    setCreated(res.data);
   }
 
   function reset() {
@@ -108,11 +121,29 @@ export default function SchedulePage() {
           {created.invitees.length > 0 && (
             <p className="mt-3 text-sm text-stone">Invites: {created.invitees.join(", ")}</p>
           )}
+          <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-line pt-4">
+            <span className="min-w-0 flex-1 truncate text-sm text-stone">{meetingUrl(created.id)}</span>
+            <CopyButton text={meetingUrl(created.id)} label="Copy meeting link" />
+          </div>
         </div>
+        <p className="text-sm text-stone">
+          Send the meeting link to your invitees — they can join without an account.
+        </p>
         <div className="flex flex-wrap gap-2">
           <Link href="/dashboard" className="pill bg-ink px-5 py-3 text-paper hover:bg-clay hover:text-ink">
             Back to dashboard
           </Link>
+          <AddToCalendar
+            className="pill bg-white px-5 py-3 text-ink hover:bg-lime"
+            event={{
+              id: created.id,
+              title: created.title,
+              description: created.description,
+              start: s,
+              duration: created.duration,
+              url: meetingUrl(created.id),
+            }}
+          />
           <button onClick={reset} className="pill bg-white px-5 py-3 text-ink hover:bg-lime">
             Schedule another
           </button>
@@ -247,8 +278,12 @@ export default function SchedulePage() {
           )}
 
           <div className="flex flex-wrap items-center gap-3 pt-2">
-            <button type="submit" className="pill bg-ink px-6 py-3.5 text-paper hover:bg-clay hover:text-ink">
-              Schedule meeting
+            <button
+              type="submit"
+              disabled={saving}
+              className="pill bg-ink px-6 py-3.5 text-paper hover:bg-clay hover:text-ink disabled:opacity-60"
+            >
+              {saving ? "Saving…" : "Schedule meeting"}
             </button>
             <Link href="/dashboard" className="text-sm text-stone hover:text-ink">
               Cancel

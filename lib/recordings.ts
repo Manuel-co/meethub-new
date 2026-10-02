@@ -62,6 +62,13 @@ export async function deleteRecording(id: string) {
   window.dispatchEvent(new Event(CHANGED));
 }
 
+/** Remove every recording this user made on this device */
+export async function deleteAllRecordings(userId: string) {
+  const all = await listForUser(userId);
+  for (const r of all) await tx("readwrite", (s) => s.delete(r.id));
+  window.dispatchEvent(new Event(CHANGED));
+}
+
 async function listForUser(userId: string): Promise<Recording[]> {
   const all = await tx<Recording[]>("readonly", (s) => s.index("userId").getAll(userId));
   return all.sort((a, b) => b.createdAt.localeCompare(a.createdAt));

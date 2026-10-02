@@ -1,4 +1,5 @@
-import type { DayHours, Meeting, User } from "./store";
+import type { DayHours, Meeting } from "./store";
+import { zonedParts, zonedToUtc } from "./tz";
 
 export const WEEKDAYS = [
   "Sunday",
@@ -10,7 +11,7 @@ export const WEEKDAYS = [
   "Saturday",
 ];
 
-/** Mon–Fri, 9 to 5 */
+/** Mon–Fri, 9 to 5 (matches the database default) */
 export const DEFAULT_HOURS: DayHours[] = WEEKDAYS.map((_, i) => ({
   enabled: i >= 1 && i <= 5,
   start: "09:00",
@@ -19,7 +20,7 @@ export const DEFAULT_HOURS: DayHours[] = WEEKDAYS.map((_, i) => ({
 
 export const DURATIONS = [15, 30, 45, 60, 90];
 
-/** How far ahead guests can book */
+/** How far ahead guests can book (the database allows 61 days) */
 export const BOOKING_HORIZON_DAYS = 60;
 
 export function toMinutes(hhmm: string) {
@@ -36,10 +37,15 @@ export function timeOptions(step = 30) {
   return out;
 }
 
-const range = (m: Meeting) => {
-  const s = new Date(m.start).getTime();
-  return [s, s + m.duration * 60_000] as const;
-};
+export type Busy = { start: number; end: number };
+
+export const busyFromMeetings = (meetings: Meeting[]): Busy[] =>
+  meetings
+    .filter((m) => m.status === "scheduled")
+    .map((m) => {
+      const start = new Date(m.start).getTime();
+      return { start, end: start + m.duration * 60_000 };
+    });
 
 export function findConflict(
   meetings: Meeting[],
@@ -51,37 +57,59 @@ export function findConflict(
   return (
     meetings.find((m) => {
       if (m.status !== "scheduled") return false;
-      const [ms, me] = range(m);
-      return s < me && e > ms;
+      const ms = new Date(m.start).getTime();
+      return s < ms + m.duration * 60_000 && e > ms;
     }) ?? null
   );
 }
 
 /**
- * Free start times on `day` for a meeting of `duration` minutes, based on the
- * host's weekly hours and existing meetings. Slots start every 15/30 min.
+ * Free start times between `from` and `to` for a meeting of `duration` minutes.
+ * Working hours are read in the host's own timezone, so a guest anywhere gets
+ * the right instants (show them with the guest's local clock).
  */
-export function getSlots(
-  host: Pick<User, "availability">,
-  day: Date,
-  meetings: Meeting[],
-  duration: number,
+export function getSlots({
+  availability,
+  timezone,
+  busy,
+  duration,
+  from,
+  to,
   now = new Date(),
-): Date[] {
-  const hours = host.availability[day.getDay()];
-  if (!hours?.enabled) return [];
-
+}: {
+  availability: DayHours[];
+  timezone: string;
+  busy: Busy[];
+  duration: number;
+  from: Date;
+  to: Date;
+  now?: Date;
+}): Date[] {
   const step = duration <= 15 ? 15 : 30;
-  const open = toMinutes(hours.start);
-  const close = toMinutes(hours.end);
+  const earliest = Math.max(from.getTime(), now.getTime());
   const slots: Date[] = [];
 
-  for (let t = open; t + duration <= close; t += step) {
-    const s = new Date(day);
-    s.setHours(0, t, 0, 0);
-    if (s.getTime() <= now.getTime()) continue;
-    if (findConflict(meetings, s, duration)) continue;
-    slots.push(s);
+  // Walk the host's calendar days covering the range (one extra each side,
+  // because the host's day can straddle the viewer's)
+  const first = zonedParts(new Date(from.getTime() - 86_400_000), timezone);
+  const last = zonedParts(new Date(to.getTime() + 86_400_000), timezone);
+  let cursor = Date.UTC(first.y, first.m - 1, first.d);
+  const end = Date.UTC(last.y, last.m - 1, last.d);
+
+  for (; cursor <= end; cursor += 86_400_000) {
+    const day = new Date(cursor);
+    const hours = availability[day.getUTCDay()];
+    if (!hours?.enabled) continue;
+    const y = day.getUTCFullYear();
+    const m = day.getUTCMonth() + 1;
+    const d = day.getUTCDate();
+    for (let t = toMinutes(hours.start); t + duration <= toMinutes(hours.end); t += step) {
+      const s = zonedToUtc(y, m, d, t, timezone).getTime();
+      const e = s + duration * 60_000;
+      if (s <= earliest || s >= to.getTime()) continue;
+      if (busy.some((b) => s < b.end && e > b.start)) continue;
+      slots.push(new Date(s));
+    }
   }
-  return slots;
+  return slots.sort((a, b) => a.getTime() - b.getTime());
 }
