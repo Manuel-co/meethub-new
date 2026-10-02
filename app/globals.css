@@ -219,6 +219,12 @@
   border: 1px solid color-mix(in oklab, var(--color-line) 60%, transparent);
 }
 
+/* Slim, low-contrast scrollbar for strips on dark backgrounds */
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--color-paper) 25%, transparent) transparent;
+}
+
 @keyframes float {
   0%, 100% { transform: translateY(0); }
   50% { transform: translateY(-10px); }

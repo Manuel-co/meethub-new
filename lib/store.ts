@@ -42,8 +42,12 @@ export type Meeting = {
   source: "manual" | "booking";
   guest?: { name: string; email: string; note?: string };
   status: "scheduled" | "cancelled";
+  /** who skips the waiting room — see migration 0004 */
+  access: MeetingAccess;
   createdAt: string;
 };
+
+export type MeetingAccess = "invite_only" | "anyone_with_link";
 
 export type ChatMessage = {
   id: string;
@@ -91,6 +95,8 @@ type MeetingRow = {
   guest_email: string | null;
   guest_note: string | null;
   status: "scheduled" | "cancelled";
+  /** missing until migration 0004 is run */
+  access?: MeetingAccess;
   created_at: string;
 };
 
@@ -136,6 +142,7 @@ const toMeeting = (r: MeetingRow): Meeting => ({
     ? { name: r.guest_name, email: r.guest_email ?? "", note: r.guest_note ?? undefined }
     : undefined,
   status: r.status,
+  access: r.access ?? "anyone_with_link",
   createdAt: r.created_at,
 });
 
@@ -386,23 +393,35 @@ export async function createMeeting(input: {
   start: string;
   duration: number;
   invitees: string[];
+  access: MeetingAccess;
 }): Promise<Result<Meeting>> {
   const hostId = state.session?.user.id;
   if (!hostId) return { ok: false, error: "You're not signed in." };
-  const { data, error } = await supabase()
-    .from("meetings")
-    .insert({
-      host_id: hostId,
-      title: input.title,
-      description: input.description,
-      start_at: input.start,
-      duration: input.duration,
-      invitees: input.invitees.map((e) => e.toLowerCase()),
-      source: "manual",
-    })
-    .select("*")
-    .single();
-  if (error) return { ok: false, error: error.message };
+  const row = {
+    host_id: hostId,
+    title: input.title,
+    description: input.description,
+    start_at: input.start,
+    duration: input.duration,
+    invitees: input.invitees.map((e) => e.toLowerCase()),
+    source: "manual",
+    access: input.access,
+  };
+  let { data, error } = await supabase().from("meetings").insert(row).select("*").single();
+  // Before migration 0004 there's no `access` column: save without it (same as "anyone with the link")
+  if (error && /access/i.test(error.message) && input.access === "anyone_with_link") {
+    const { access: _ignored, ...withoutAccess } = row;
+    void _ignored;
+    ({ data, error } = await supabase().from("meetings").insert(withoutAccess).select("*").single());
+  }
+  if (error) {
+    return {
+      ok: false,
+      error: /access/i.test(error.message)
+        ? "Invite-only meetings aren't set up yet. Run supabase/migrations/0004_meeting_access.sql in the Supabase SQL editor."
+        : error.message,
+    };
+  }
   const meeting = toMeeting(data as MeetingRow);
   set({
     meetings: [...state.meetings.filter((m) => m.id !== meeting.id), meeting].sort(
@@ -410,6 +429,39 @@ export async function createMeeting(input: {
     ),
   });
   return { ok: true, data: meeting };
+}
+
+/**
+ * Start a meeting right now, no scheduling. It's a normal meeting record (so
+ * it gets the waiting room, attendance and History) that begins immediately.
+ */
+export function createInstantMeeting(hostName?: string) {
+  const time = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return createMeeting({
+    title: hostName ? `${hostName.split(" ")[0]}'s meeting · ${time}` : `Instant meeting · ${time}`,
+    description: "",
+    start: new Date().toISOString(),
+    duration: 60,
+    invitees: [],
+    access: "anyone_with_link",
+  });
+}
+
+/** Host: switch a meeting between invite-only and anyone-with-the-link */
+export async function setMeetingAccess(id: string, access: MeetingAccess): Promise<Result> {
+  const before = state.meetings.find((m) => m.id === id)?.access;
+  set({ meetings: state.meetings.map((m) => (m.id === id ? { ...m, access } : m)) });
+  const { error } = await supabase().from("meetings").update({ access }).eq("id", id);
+  if (error) {
+    if (before) set({ meetings: state.meetings.map((m) => (m.id === id ? { ...m, access: before } : m)) });
+    return {
+      ok: false,
+      error: /access/i.test(error.message)
+        ? "Meeting access isn't set up yet. Run supabase/migrations/0004_meeting_access.sql in the Supabase SQL editor."
+        : error.message,
+    };
+  }
+  return { ok: true, data: undefined };
 }
 
 export async function cancelMeeting(id: string): Promise<Result> {
@@ -479,15 +531,32 @@ export type PublicMeeting = {
   duration: number;
   status: "scheduled" | "cancelled";
   hostName: string;
+  access: MeetingAccess;
 };
 
 /** Title/time for the meeting room — anyone with the link can see this */
 export async function getMeetingPublic(id: string): Promise<PublicMeeting | null> {
   if (!/^[0-9a-f-]{36}$/i.test(id)) return null; // ad-hoc rooms aren't in the database
   const { data } = await supabase().rpc("get_meeting_public", { p_id: id });
-  const row = (data as { id: string; title: string; start_at: string; duration: number; status: "scheduled" | "cancelled"; host_name: string }[] | null)?.[0];
+  const row = (data as {
+    id: string;
+    title: string;
+    start_at: string;
+    duration: number;
+    status: "scheduled" | "cancelled";
+    host_name: string;
+    access?: MeetingAccess;
+  }[] | null)?.[0];
   return row
-    ? { id: row.id, title: row.title, start: row.start_at, duration: row.duration, status: row.status, hostName: row.host_name }
+    ? {
+        id: row.id,
+        title: row.title,
+        start: row.start_at,
+        duration: row.duration,
+        status: row.status,
+        hostName: row.host_name,
+        access: row.access ?? "anyone_with_link",
+      }
     : null;
 }
 
@@ -522,8 +591,127 @@ export async function joinMeeting(meetingId: string): Promise<string | null> {
   return (data as { id: string } | null)?.id ?? null;
 }
 
+/**
+ * Mark the user as present "until now". Called on leave, and every 30s while
+ * in the call — so if the tab is closed or the phone kills the browser
+ * (no goodbye), the recorded time is still accurate to within ~30 seconds.
+ */
 export async function leaveMeeting(attendanceId: string) {
   await supabase().from("attendance").update({ left_at: new Date().toISOString() }).eq("id", attendanceId);
+}
+export const touchAttendance = leaveMeeting;
+
+/* ------------------------------------------------------------ waiting room */
+
+export type JoinRequest = {
+  id: string;
+  meetingId: string;
+  name: string;
+  avatar: AvatarSpec | null;
+  status: "pending" | "admitted" | "denied";
+  createdAt: string;
+};
+
+/** The signed-in user's access token, so the server can verify who's asking */
+export async function currentAccessToken(): Promise<string | null> {
+  if (!supabaseConfigured()) return null;
+  const { data } = await supabase().auth.getSession();
+  return data.session?.access_token ?? null;
+}
+
+const REQUEST_ERRORS: Record<string, string> = {
+  meeting_not_found: "This meeting doesn't exist.",
+  meeting_cancelled: "This meeting was cancelled.",
+  invite_only: "This meeting is invite only. Log in with the email you were invited with.",
+  invalid_name: "Please enter your name.",
+  too_many_requests: "Lots of people are waiting right now. Please try again in a minute.",
+};
+
+/** Guest: ask the host to let you in. Keep `secret` private — it proves the request is yours. */
+export async function requestToJoin(
+  meetingId: string,
+  name: string,
+  secret: string,
+  avatar: AvatarSpec | null,
+): Promise<Result<string>> {
+  const { data, error } = await supabase().rpc("request_to_join", {
+    p_meeting: meetingId,
+    p_name: name,
+    p_secret: secret,
+    p_avatar: avatar ? JSON.parse(encodeAvatar(avatar)) : null,
+  });
+  if (error) {
+    const code = Object.keys(REQUEST_ERRORS).find((k) => error.message.includes(k));
+    if (/could not find the function/i.test(error.message)) {
+      return {
+        ok: false,
+        error: "The waiting room isn't set up yet. Run supabase/migrations/0003_waiting_room.sql in the Supabase SQL editor.",
+      };
+    }
+    return { ok: false, error: code ? REQUEST_ERRORS[code] : "Couldn't send your request. Please try again." };
+  }
+  return { ok: true, data: data as string };
+}
+
+/** Guest: has the host decided yet? */
+export async function joinRequestStatus(id: string, secret: string) {
+  const { data } = await supabase().rpc("join_request_status", { p_id: id, p_secret: secret });
+  return (data as JoinRequest["status"] | null) ?? null;
+}
+
+type JoinRequestRow = {
+  id: string;
+  meeting_id: string;
+  name: string;
+  avatar: unknown;
+  status: JoinRequest["status"];
+  created_at: string;
+};
+
+const toJoinRequest = (r: JoinRequestRow): JoinRequest => ({
+  id: r.id,
+  meetingId: r.meeting_id,
+  name: r.name,
+  avatar: r.avatar ? parseAvatar(JSON.stringify(r.avatar)) : null,
+  status: r.status,
+  createdAt: r.created_at,
+});
+
+/** Host: people currently waiting to join */
+export async function listPendingRequests(meetingId: string): Promise<JoinRequest[]> {
+  const { data } = await supabase()
+    .from("join_requests")
+    .select("id, meeting_id, name, avatar, status, created_at")
+    .eq("meeting_id", meetingId)
+    .eq("status", "pending")
+    .order("created_at");
+  return ((data ?? []) as JoinRequestRow[]).map(toJoinRequest);
+}
+
+/** Host: admit or deny one or more requests */
+export async function decideJoinRequests(ids: string[], status: "admitted" | "denied"): Promise<Result> {
+  if (!ids.length) return { ok: true, data: undefined };
+  const { error } = await supabase()
+    .from("join_requests")
+    .update({ status, decided_at: new Date().toISOString() })
+    .in("id", ids);
+  if (error) return { ok: false, error: error.message };
+  return { ok: true, data: undefined };
+}
+
+/** Host: call `onChange` whenever a request for this meeting is created or updated */
+export function watchJoinRequests(meetingId: string, onChange: () => void) {
+  const ch = supabase()
+    .channel(`join-requests-${meetingId}-${Date.now()}`)
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "join_requests", filter: `meeting_id=eq.${meetingId}` },
+      onChange,
+    )
+    .subscribe();
+  return () => {
+    void supabase().removeChannel(ch);
+  };
 }
 
 /** Chat transcripts and attendance for the History page */

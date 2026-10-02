@@ -153,7 +153,19 @@ export default function HistoryPage() {
                       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:gap-6">
                         <div className="flex w-28 shrink-0 flex-col">
                           <span className="text-lg tracking-[-0.02em]">{fmtTime(new Date(m.start))}</span>
-                          <span className="text-xs text-stone">{fmtDuration(m.duration)}</span>
+                          {(() => {
+                            const lasted = actualLength(extras.attendance, m);
+                            return lasted !== null ? (
+                              <>
+                                <span className="text-xs text-ink" title="From the first person joining to the last one leaving">
+                                  Lasted {lasted < 1 ? "under 1 min" : fmtDuration(lasted)}
+                                </span>
+                                <span className="text-xs text-stone">Scheduled {fmtDuration(m.duration)}</span>
+                              </>
+                            ) : (
+                              <span className="text-xs text-stone">{fmtDuration(m.duration)}</span>
+                            );
+                          })()}
                         </div>
                         <div className="flex min-w-0 flex-1 flex-col gap-1.5">
                           <div className="flex flex-wrap items-center gap-2">
@@ -249,16 +261,29 @@ export default function HistoryPage() {
   );
 }
 
+/**
+ * How long the call actually ran, in minutes: first join → last "present
+ * until" time across everyone we can see (hosts see all attendees; invitees
+ * only themselves). Null if nobody's attendance was recorded.
+ */
+function actualLength(all: Attendance[], m: Meeting) {
+  const rows = all.filter((a) => a.meetingId === m.id);
+  if (!rows.length) return null;
+  const start = Math.min(...rows.map((a) => new Date(a.joinedAt).getTime()));
+  const end = Math.max(...rows.map((a) => new Date(a.leftAt ?? a.joinedAt).getTime()));
+  return Math.round((end - start) / 60_000);
+}
+
 /** How long `userId` spent in meeting `m`, or null if they never joined */
 function attendanceFor(all: Attendance[], m: Meeting, userId: string, now: Date) {
   const mine = all.filter((a) => a.meetingId === m.id && a.userId === userId);
   if (!mine.length) return null;
-  // If the tab closed before "left" was saved, assume they stayed until the end
-  const meetingEnd = Math.min(now.getTime(), new Date(m.start).getTime() + m.duration * 60_000);
+  // "left" is refreshed every 30s during the call, so if it's missing they
+  // were only there for a few seconds — unless they're in the call right now
   const ms = mine.reduce((n, a) => {
     const joined = new Date(a.joinedAt).getTime();
-    const left = a.leftAt ? new Date(a.leftAt).getTime() : Math.max(joined, meetingEnd);
-    return n + (left - joined);
+    const left = a.leftAt ? new Date(a.leftAt).getTime() : joined;
+    return n + Math.max(0, Math.min(left, now.getTime()) - joined);
   }, 0);
   return { minutes: Math.round(ms / 60_000) };
 }

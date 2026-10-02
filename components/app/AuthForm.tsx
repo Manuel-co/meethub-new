@@ -17,9 +17,12 @@ export default function AuthForm({ mode }: { mode: "login" | "signup" }) {
   const [pending, setPending] = useState(false);
   const [checkEmail, setCheckEmail] = useState(false);
 
-  // Signed in (now or already)? Go to the app.
+  // Signed in (now or already)? Go back where they came from (e.g. a meeting
+  // link), or to the app. Only same-site paths, never another website.
   useEffect(() => {
-    if (user) router.replace("/dashboard");
+    if (!user) return;
+    const next = new URLSearchParams(window.location.search).get("next");
+    router.replace(next && /^\/(?!\/)/.test(next) ? next : "/dashboard");
   }, [user, router]);
 
   const isSignup = mode === "signup";

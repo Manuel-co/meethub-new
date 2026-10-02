@@ -37,6 +37,26 @@ export async function listDevices() {
   }
 }
 
+export type PermissionStatus = "granted" | "denied" | "prompt" | "unknown";
+
+/**
+ * Has this site been allowed to use the camera/microphone? Asking does NOT
+ * trigger the browser prompt. Some browsers (e.g. older Firefox, Safari)
+ * don't support the query — that's "unknown".
+ */
+export async function queryPermission(kind: DeviceKind): Promise<PermissionStatus> {
+  try {
+    const res = await navigator.permissions.query({ name: kind as PermissionName });
+    return res.state as PermissionStatus;
+  } catch {
+    return "unknown";
+  }
+}
+
+/** Is this a "permission denied" error (rather than no device / device busy)? */
+export const isPermissionError = (err: unknown) =>
+  err instanceof Error && (err.name === "NotAllowedError" || /permission denied|not allowed/i.test(err.message));
+
 /** Devices we can actually pick by id (after permission), minus Chrome's "default"/"communications" aliases */
 export const selectable = (list: MediaDeviceInfo[]) =>
   list.filter((d) => d.deviceId && d.deviceId !== "default" && d.deviceId !== "communications");

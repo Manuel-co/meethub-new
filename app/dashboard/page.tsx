@@ -1,14 +1,23 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
-import { ArrowUpRight, CalendarPlus, Clock, Link2, Mail, Users, Video, X } from "lucide-react";
+import { ArrowUpRight, CalendarPlus, Clock, Link2, Loader2, Mail, Users, Video, X, Zap } from "lucide-react";
 import Avatar from "@/components/app/Avatar";
 import AddToCalendar from "@/components/app/AddToCalendar";
 import { meetingUrl } from "@/lib/calendar";
 import CopyButton from "@/components/app/CopyButton";
 import { useNow } from "@/components/app/useNow";
-import { cancelMeeting, useCurrentUser, useMyMeetings, type Meeting } from "@/lib/store";
+import { ACCESS_OPTIONS } from "@/components/app/AccessPicker";
+import {
+  cancelMeeting,
+  createInstantMeeting,
+  setMeetingAccess,
+  useCurrentUser,
+  useMyMeetings,
+  type Meeting,
+} from "@/lib/store";
 import { addDays, dayLabel, fmtDuration, fmtTime, fromNow, startOfDay } from "@/lib/format";
 
 const endOf = (m: Meeting) => new Date(new Date(m.start).getTime() + m.duration * 60_000);
@@ -23,6 +32,22 @@ export default function DashboardPage() {
   const all = useMyMeetings();
   const now = useNow();
   const [showPast, setShowPast] = useState(false);
+  const router = useRouter();
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState("");
+
+  // Instant meeting: create it now and go straight into the room
+  async function startNow() {
+    setStarting(true);
+    setStartError("");
+    const res = await createInstantMeeting(user.name);
+    if (!res.ok) {
+      setStarting(false);
+      setStartError(`Couldn't start a meeting: ${res.error}`);
+      return;
+    }
+    router.push(`/meet/${res.data.id}`);
+  }
 
   const { upcoming, past, thisWeek, booked, groups } = useMemo(() => {
     const active = all
@@ -64,13 +89,29 @@ export default function DashboardPage() {
             {greeting(now)}, {user.name.split(" ")[0]}.
           </h1>
         </div>
-        <Link
-          href="/dashboard/schedule"
-          className="pill bg-ink px-5 py-3 text-paper hover:bg-clay hover:text-ink"
-        >
-          <CalendarPlus size={14} /> Schedule meeting
-        </Link>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={startNow}
+            disabled={starting}
+            className="pill bg-lime px-5 py-3 text-ink hover:bg-ink hover:text-paper disabled:opacity-60"
+          >
+            {starting ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
+            Start meeting now
+          </button>
+          <Link
+            href="/dashboard/schedule"
+            className="pill bg-ink px-5 py-3 text-paper hover:bg-clay hover:text-ink"
+          >
+            <CalendarPlus size={14} /> Schedule meeting
+          </Link>
+        </div>
       </header>
+      {startError && (
+        <p role="alert" className="-mt-6 rounded-lg bg-clay/20 px-3 py-2 text-sm">
+          {startError}
+        </p>
+      )}
 
       {/* Stats */}
       <section className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -118,6 +159,7 @@ export default function DashboardPage() {
                       m={m}
                       now={now}
                       onCancel={m.hostId === user.id ? () => onCancel(m) : undefined}
+                      isHost={m.hostId === user.id}
                     />
                   ))}
                 </ul>
@@ -229,14 +271,25 @@ function MeetingRow({
   now,
   past,
   onCancel,
+  isHost = false,
 }: {
   m: Meeting;
   now: Date;
   past?: boolean;
   onCancel?: () => void;
+  isHost?: boolean;
 }) {
   const start = new Date(m.start);
   const live = !past && start <= now;
+  const access = ACCESS_OPTIONS.find((o) => o.value === m.access) ?? ACCESS_OPTIONS[0];
+  const AccessIcon = access.icon;
+
+  function toggleAccess() {
+    const next = m.access === "invite_only" ? "anyone_with_link" : "invite_only";
+    setMeetingAccess(m.id, next).then((res) => {
+      if (!res.ok) window.alert(res.error);
+    });
+  }
   return (
     <li className="panel group flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:gap-6 sm:p-5">
       <div className="flex w-28 shrink-0 flex-col">
@@ -249,6 +302,20 @@ function MeetingRow({
           <p className="truncate font-medium">{m.title}</p>
           {live && <span className="chip bg-clay text-ink">Live</span>}
           {m.source === "booking" && <span className="chip bg-lime text-ink">Booked</span>}
+          {isHost && !past ? (
+            <button
+              type="button"
+              onClick={toggleAccess}
+              title={`${access.description} Click to switch.`}
+              className="chip bg-paper text-ink transition-colors hover:bg-paper-deep"
+            >
+              <AccessIcon size={11} /> {access.short}
+            </button>
+          ) : (
+            <span className="chip bg-paper text-stone" title={access.description}>
+              <AccessIcon size={11} /> {access.short}
+            </span>
+          )}
         </div>
         {m.guest ? (
           <p className="flex items-center gap-1.5 truncate text-sm text-stone">

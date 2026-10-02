@@ -6,7 +6,8 @@ import { AlertTriangle, Check, Clock, X } from "lucide-react";
 import AddToCalendar from "@/components/app/AddToCalendar";
 import CopyButton from "@/components/app/CopyButton";
 import { meetingUrl } from "@/lib/calendar";
-import { createMeeting, useCurrentUser, useMeetings, type Meeting } from "@/lib/store";
+import AccessPicker from "@/components/app/AccessPicker";
+import { createMeeting, useCurrentUser, useMeetings, type Meeting, type MeetingAccess } from "@/lib/store";
 import { DURATIONS, busyFromMeetings, findConflict, getSlots } from "@/lib/scheduling";
 import {
   addDays,
@@ -31,6 +32,7 @@ export default function SchedulePage() {
   const [time, setTime] = useState("10:00");
   const [duration, setDuration] = useState(30);
   const [invitees, setInvitees] = useState<string[]>([]);
+  const [access, setAccess] = useState<MeetingAccess>("anyone_with_link");
   const [inviteDraft, setInviteDraft] = useState("");
   const [error, setError] = useState("");
   const [created, setCreated] = useState<Meeting | null>(null);
@@ -90,6 +92,7 @@ export default function SchedulePage() {
       start: start.toISOString(),
       duration,
       invitees: list,
+      access,
     });
     setSaving(false);
     if (!res.ok) return setError(`Couldn't save the meeting: ${res.error}`);
@@ -269,6 +272,11 @@ export default function SchedulePage() {
                 onBlur={() => inviteDraft.trim() && addInvitee(inviteDraft)}
               />
             </div>
+          </div>
+
+          <div>
+            <span className="label">Who can join?</span>
+            <AccessPicker value={access} onChange={setAccess} />
           </div>
 
           {error && (

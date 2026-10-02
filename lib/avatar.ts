@@ -8,15 +8,22 @@ import { glass, lorelei, notionists, openPeeps, pixelArt, thumbs } from "@dicebe
 // Only MIT-licensed DiceBear styles, so no attribution is required.
 // (Other styles are CC BY 4.0 and would need a credit on the site.)
 export const AVATAR_STYLES = {
-  notionists: { label: "Notionists", style: notionists },
-  lorelei: { label: "Lorelei", style: lorelei },
-  openPeeps: { label: "Open Peeps", style: openPeeps },
-  thumbs: { label: "Thumbs", style: thumbs },
-  pixelArt: { label: "Pixel art", style: pixelArt },
-  glass: { label: "Glass", style: glass },
+  notionists: { label: "Notionists", style: notionists, pickable: true },
+  lorelei: { label: "Lorelei", style: lorelei, pickable: true },
+  openPeeps: { label: "Open Peeps", style: openPeeps, pickable: true },
+  thumbs: { label: "Thumbs", style: thumbs, pickable: true },
+  pixelArt: { label: "Pixel art", style: pixelArt, pickable: true },
+  // Looks like an empty bubble at small sizes — still drawn for anyone who
+  // already has it, but no longer offered or picked at random
+  glass: { label: "Glass", style: glass, pickable: false },
 } as const;
 
 export type AvatarStyleId = keyof typeof AVATAR_STYLES;
+
+/** Styles offered in the picker and used for random avatars */
+export const PICKABLE_STYLES = (Object.keys(AVATAR_STYLES) as AvatarStyleId[]).filter(
+  (id) => AVATAR_STYLES[id].pickable,
+);
 
 export type AvatarSpec =
   | { kind: "dicebear"; style: AvatarStyleId; seed: string }
@@ -34,10 +41,9 @@ const isStyle = (s: unknown): s is AvatarStyleId =>
 export const randomSeed = () => crypto.randomUUID().slice(0, 12);
 
 export function randomAvatar(style?: AvatarStyleId): AvatarSpec {
-  const ids = Object.keys(AVATAR_STYLES) as AvatarStyleId[];
   return {
     kind: "dicebear",
-    style: style ?? ids[Math.floor(Math.random() * ids.length)],
+    style: style ?? PICKABLE_STYLES[Math.floor(Math.random() * PICKABLE_STYLES.length)],
     seed: randomSeed(),
   };
 }

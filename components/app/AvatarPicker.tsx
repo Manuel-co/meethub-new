@@ -5,6 +5,7 @@ import { ImagePlus, Shuffle, Trash2 } from "lucide-react";
 import ProfileAvatar from "@/components/app/ProfileAvatar";
 import {
   AVATAR_STYLES,
+  PICKABLE_STYLES,
   photoFromFile,
   randomAvatar,
   randomSeed,
@@ -78,7 +79,7 @@ export default function AvatarPicker({
 
       {/* Same seed in every style, so you can compare looks */}
       <div className="grid max-w-sm grid-cols-6 gap-2" role="radiogroup" aria-label="Avatar style">
-        {(Object.keys(AVATAR_STYLES) as AvatarStyleId[]).map((id) => {
+        {PICKABLE_STYLES.map((id) => {
           const selected = value.kind === "dicebear" && value.style === id;
           return (
             <button

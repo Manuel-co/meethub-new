@@ -26,12 +26,17 @@ import {
   ConnectionErrorReason,
   ConnectionState,
   DisconnectReason,
+  ParticipantEvent,
+  RoomEvent,
   Track,
+  type LocalTrackPublication,
   type Participant,
 } from "livekit-client";
 import {
   Check,
   Circle,
+  Ellipsis,
+  Lock,
   Hand,
   Link2,
   Loader2,
@@ -57,11 +62,28 @@ import {
   saveAvatar,
   type AvatarSpec,
 } from "@/lib/avatar";
-import { describeMediaError, listDevices, selectable } from "@/lib/media";
-import SelectField from "@/components/app/SelectField";
 import {
+  describeMediaError,
+  isPermissionError,
+  listDevices,
+  queryPermission,
+  selectable,
+} from "@/lib/media";
+import DevicePermissionDialog, { type DeviceAsk } from "@/components/app/DevicePermissionDialog";
+import ShareScreenDialog from "@/components/app/ShareScreenDialog";
+import SelectField from "@/components/app/SelectField";
+import { useNow } from "@/components/app/useNow";
+import {
+  currentAccessToken,
+  decideJoinRequests,
   getMeetingPublic,
   joinMeeting,
+  joinRequestStatus,
+  listPendingRequests,
+  requestToJoin,
+  touchAttendance,
+  watchJoinRequests,
+  type JoinRequest,
   leaveMeeting,
   saveChatMessage,
   updateProfile,
@@ -89,8 +111,11 @@ type Session = {
   avatar: AvatarSpec;
 };
 
+/** A pending "let me in" request (the secret proves it's ours) */
+type WaitingRequest = { id: string; secret: string; name: string };
+
 /** What the room needs to know about a scheduled meeting */
-type RoomInfo = Pick<Meeting, "id" | "title" | "start" | "duration" | "status">;
+type RoomInfo = Pick<Meeting, "id" | "title" | "start" | "duration" | "status" | "access">;
 
 export default function MeetPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
@@ -237,13 +262,18 @@ function PreJoin({
   onJoin: (s: Session) => void;
 }) {
   const user = useCurrentUser();
-  const [name, setName] = useState(() => {
+  // What the user typed (null = untouched). Until they type, signed-in users
+  // get their profile name — which can arrive a moment after this renders —
+  // and guests get the name they used last time on this device.
+  const [typedName, setName] = useState<string | null>(null);
+  const [lastUsedName] = useState(() => {
     try {
-      return user?.name ?? localStorage.getItem(NAME_KEY) ?? "";
+      return localStorage.getItem(NAME_KEY) ?? "";
     } catch {
-      return user?.name ?? "";
+      return "";
     }
   });
+  const name = typedName ?? user?.name ?? lastUsedName;
   const [audio, setAudio] = useState(true);
   const [video, setVideo] = useState(true);
   const [error, setError] = useState("");
@@ -289,9 +319,58 @@ function PreJoin({
   const camChoices = selectable(cameras);
   const micChoices = selectable(mics);
 
+  /* ---- our own permission dialogs (before/after the browser's prompt) ---- */
+  // false until we know it's OK to touch the camera without surprising anyone
+  const [primed, setPrimed] = useState(false);
+  const [permDialog, setPermDialog] = useState<{ mode: "ask" | "blocked"; devices: DeviceAsk } | null>(null);
+  const [camBlocked, setCamBlocked] = useState(false);
+
+  useEffect(() => {
+    Promise.all([queryPermission("camera"), queryPermission("microphone")]).then(([cam, mic]) => {
+      const camAsk = cam === "prompt";
+      const micAsk = mic === "prompt";
+      if (camAsk || micAsk) {
+        // First visit: explain before the browser asks
+        setPermDialog({ mode: "ask", devices: camAsk && micAsk ? "both" : camAsk ? "camera" : "microphone" });
+      } else {
+        setPrimed(true);
+        if (cam === "denied" || mic === "denied") {
+          setPermDialog({ mode: "blocked", devices: cam === "denied" && mic === "denied" ? "both" : cam === "denied" ? "camera" : "microphone" });
+        }
+      }
+    });
+  }, []);
+
+  /** "Allow" / "Try again": trigger the browser's own prompt for what's needed */
+  async function requestDevices(devices: DeviceAsk) {
+    setPermDialog(null);
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({
+        video: devices !== "microphone",
+        audio: devices !== "camera",
+      });
+      s.getTracks().forEach((t) => t.stop());
+      setCamBlocked(false);
+      setCamError("");
+      setCamAttempt((n) => n + 1);
+    } catch (err) {
+      if (isPermissionError(err)) setPermDialog({ mode: "blocked", devices });
+      else setCamError(describeMediaError(err, devices === "microphone" ? "microphone" : "camera"));
+    } finally {
+      setPrimed(true);
+    }
+  }
+
+  function skipDevices(devices: DeviceAsk) {
+    setPermDialog(null);
+    if (devices !== "microphone") setVideo(false);
+    if (devices !== "camera") setAudio(false);
+    setPrimed(true);
+  }
+
   // Camera preview while deciding
   useEffect(() => {
-    if (!wantVideo) return;
+    if (!wantVideo || !primed) return;
     let stream: MediaStream | undefined;
     let cancelled = false;
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -318,6 +397,7 @@ function PreJoin({
       .catch((err) => {
         if (cancelled) return;
         setPreviewOn(false);
+        setCamBlocked(isPermissionError(err));
         setCamError(describeMediaError(err, "camera"));
       });
     return () => {
@@ -325,50 +405,158 @@ function PreJoin({
       stream?.getTracks().forEach((t) => t.stop());
       setPreviewOn(false);
     };
-  }, [wantVideo, camId, camAttempt]);
+  }, [wantVideo, camId, camAttempt, primed]);
+
+  /* ---- waiting room ---- */
+  const requestKey = `meethub:join-request:${roomId}`;
+  // Survives a refresh, so people don't lose their place in the queue
+  const [waiting, setWaiting] = useState<WaitingRequest | null>(() => {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(requestKey) ?? "null");
+      return saved?.id && saved?.secret && saved?.name ? saved : null;
+    } catch {
+      return null;
+    }
+  });
+  const [declined, setDeclined] = useState(false);
+  // Invite-only meeting and this person isn't on the list
+  const [notInvited, setNotInvited] = useState<{ message: string; signedIn: boolean } | null>(null);
+
+  function rememberRequest(r: WaitingRequest | null) {
+    try {
+      if (r) sessionStorage.setItem(requestKey, JSON.stringify(r));
+      else sessionStorage.removeItem(requestKey);
+    } catch {}
+    setWaiting(r);
+  }
+
+  /** Ask the server for a meeting pass */
+  async function fetchPass(n: string, req?: WaitingRequest) {
+    const accessToken = await currentAccessToken();
+    const res = await fetch("/api/livekit/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+      },
+      body: JSON.stringify({ room: roomId, name: n, requestId: req?.id, requestSecret: req?.secret }),
+    });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, data } as {
+      ok: boolean;
+      data: { token?: string; url?: string; error?: string; code?: string };
+    };
+  }
+
+  function enter(n: string, pass: { token?: string; url?: string }) {
+    try {
+      localStorage.setItem(NAME_KEY, n);
+    } catch {}
+    rememberRequest(null);
+    onJoin({
+      token: pass.token!,
+      url: pass.url!,
+      name: n,
+      // still try in the room even if the preview failed — the user may
+      // have fixed it since, and the room shows a clear message if not
+      video: wantVideo,
+      audio,
+      camId: camId !== DEFAULT_DEVICE ? camId : undefined,
+      micId: micId !== DEFAULT_DEVICE ? micId : undefined,
+      avatar,
+    });
+  }
 
   async function join(e: React.FormEvent) {
     e.preventDefault();
     const n = name.trim();
     if (!n) return setError("Please enter your name.");
     setError("");
+    setDeclined(false);
+    setNotInvited(null);
     setPending(true);
     try {
-      const res = await fetch("/api/livekit/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ room: roomId, name: n }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Couldn't join the meeting.");
-      try {
-        localStorage.setItem(NAME_KEY, n);
-      } catch {}
-      onJoin({
-        token: data.token,
-        url: data.url,
-        name: n,
-        // still try in the room even if the preview failed — the user may
-        // have fixed it since, and the room shows a clear message if not
-        video: wantVideo,
-        audio,
-        camId: camId !== DEFAULT_DEVICE ? camId : undefined,
-        micId: micId !== DEFAULT_DEVICE ? micId : undefined,
-        avatar,
-      });
+      const pass = await fetchPass(n);
+      if (pass.ok) return enter(n, pass.data);
+      if (pass.data.code === "invite_only") {
+        // No waiting room for invite-only meetings
+        setNotInvited({
+          message: pass.data.error ?? "This meeting is invite only.",
+          signedIn: Boolean((pass.data as { signedIn?: boolean }).signedIn),
+        });
+        return;
+      }
+      if (pass.data.code !== "approval_required") {
+        throw new Error(pass.data.error ?? "Couldn't join the meeting.");
+      }
+      // Not the host: knock and wait in the waiting room
+      const secret = crypto.randomUUID() + crypto.randomUUID();
+      const req = await requestToJoin(roomId, n, secret, avatar);
+      if (!req.ok) throw new Error(req.error);
+      rememberRequest({ id: req.data, secret, name: n });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Couldn't join the meeting.");
+    } finally {
       setPending(false);
     }
   }
+
+  // While waiting: check every couple of seconds whether the host decided
+  useEffect(() => {
+    if (!waiting) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const check = async () => {
+      const status = await joinRequestStatus(waiting.id, waiting.secret).catch(() => "pending" as const);
+      if (stopped) return;
+      if (status === "admitted") {
+        const pass = await fetchPass(waiting.name, waiting);
+        if (stopped) return;
+        if (pass.ok) return enter(waiting.name, pass.data);
+        setError(pass.data.error ?? "Couldn't join the meeting.");
+        rememberRequest(null);
+        return;
+      }
+      if (status === "denied" || status === null) {
+        rememberRequest(null);
+        setDeclined(status === "denied");
+        if (status === null) setError("Your request expired. Please ask to join again.");
+        return;
+      }
+      timer = setTimeout(check, 2000);
+    };
+    check();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+    // re-run only when the request itself changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [waiting?.id]);
 
   const start = meeting ? new Date(meeting.start) : null;
 
   return (
     <div className="flex min-h-[100svh] w-full items-center justify-center bg-ink px-4 py-10 text-paper">
+      {permDialog && (
+        <DevicePermissionDialog
+          open
+          mode={permDialog.mode}
+          devices={permDialog.devices}
+          onOpenChange={(o) => {
+            if (o) return;
+            // Dismissing the "ask" dialog = continue without; dismissing "blocked" = just close
+            if (permDialog.mode === "ask") skipDevices(permDialog.devices);
+            else setPermDialog(null);
+          }}
+          onAllow={() => requestDevices(permDialog.devices)}
+          onSkip={() => skipDevices(permDialog.devices)}
+        />
+      )}
       <div className="grid w-full max-w-5xl grid-cols-1 items-start gap-10 lg:grid-cols-2 lg:items-center">
         <div className="flex flex-col gap-3">
-          <div className="relative aspect-video w-full overflow-hidden rounded-[1.25rem] bg-black/40">
+          {/* taller on phones so the avatar, message and buttons all fit */}
+          <div className="relative aspect-[4/3] w-full overflow-hidden rounded-[1.25rem] bg-black/40 sm:aspect-video">
             {wantVideo && (
               <video
                 ref={preview}
@@ -379,20 +567,22 @@ function PreJoin({
               />
             )}
             {(!wantVideo || !previewOn) && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 pb-16 text-center">
-                <ProfileAvatar name={name || "?"} avatar={avatar} size={96} />
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-6 pb-16 text-center sm:gap-3">
+                <ProfileAvatar name={name || "?"} avatar={avatar} size={96} className="max-sm:!size-16" />
                 {wantVideo && camError ? (
                   <>
                     <p className="max-w-sm text-xs text-paper/70">{camError}</p>
                     <button
                       type="button"
                       onClick={() => {
+                        // Blocked: show how to unblock; anything else: just retry
+                        if (camBlocked) return setPermDialog({ mode: "blocked", devices: "camera" });
                         setCamError("");
                         setCamAttempt((n) => n + 1);
                       }}
                       className="pill bg-paper text-ink hover:bg-lime"
                     >
-                      Try again
+                      {camBlocked ? "How to fix" : "Try again"}
                     </button>
                   </>
                 ) : wantVideo ? (
@@ -457,7 +647,60 @@ function PreJoin({
           )}
         </div>
 
+        {waiting ? (
+          <div className="flex flex-col items-start gap-6" role="status" aria-live="polite">
+            <div className="flex items-center gap-4">
+              <span className="relative flex">
+                <ProfileAvatar name={waiting.name} avatar={avatar} size={64} />
+                <span className="absolute -right-1 -top-1 flex h-5 w-5 items-center justify-center rounded-full bg-lime">
+                  <Loader2 size={12} className="animate-spin text-ink" />
+                </span>
+              </span>
+              <div className="flex flex-col gap-1">
+                <span className="text-sm text-paper/60">Waiting room</span>
+                <h1 className="display text-[clamp(1.8rem,4vw,2.6rem)]">Asking to join…</h1>
+              </div>
+            </div>
+            <p className="max-w-md text-[15px] text-paper/70">
+              {meeting?.title ? `You'll join "${meeting.title}"` : "You'll join"} as soon as the host lets you
+              in. Keep this page open.
+            </p>
+            <button
+              type="button"
+              onClick={() => rememberRequest(null)}
+              className="pill bg-paper/10 px-5 py-3 text-paper hover:bg-paper/20"
+            >
+              Cancel
+            </button>
+          </div>
+        ) : (
         <form onSubmit={join} className="flex flex-col gap-6">
+          {notInvited && (
+            <div role="alert" className="flex flex-col items-start gap-3 rounded-xl bg-paper/10 p-4 text-sm">
+              <p className="flex items-center gap-2 font-medium">
+                <Lock size={14} /> Invite only
+              </p>
+              <p className="text-paper/80">{notInvited.message}</p>
+              {!notInvited.signedIn && (
+                <Link
+                  href={`/login?next=${encodeURIComponent(`/meet/${roomId}`)}`}
+                  className="pill bg-paper text-ink hover:bg-lime"
+                >
+                  Log in
+                </Link>
+              )}
+            </div>
+          )}
+          {!notInvited && meeting?.access === "invite_only" && !user && (
+            <p className="flex items-center gap-2 text-sm text-paper/70">
+              <Lock size={14} className="shrink-0" /> Invite only — log in with the email you were invited with.
+            </p>
+          )}
+          {declined && (
+            <p role="alert" className="rounded-lg bg-clay/90 px-3 py-2 text-sm text-ink">
+              The host didn&apos;t let you in this time. You can ask again.
+            </p>
+          )}
           <div className="flex flex-col gap-2">
             <span className="text-sm text-paper/60">Ready to join?</span>
             <h1 className="display text-[clamp(2.2rem,4vw,3.2rem)]">{meeting?.title ?? "MeetHub meeting"}</h1>
@@ -509,6 +752,7 @@ function PreJoin({
             {pending && <Loader2 size={14} className="animate-spin" />} Join now
           </button>
         </form>
+        )}
       </div>
     </div>
   );
@@ -564,6 +808,14 @@ function Room({
   const participants = useParticipants();
   const { localParticipant, isMicrophoneEnabled, isCameraEnabled } = useLocalParticipant();
   const [deviceNotice, setDeviceNotice] = useState("");
+  // Device notices cover the top tiles, so they go away on their own
+  useEffect(() => {
+    if (!deviceNotice) return;
+    const t = setTimeout(() => setDeviceNotice(""), 8000);
+    return () => clearTimeout(t);
+  }, [deviceNotice]);
+  // Camera/mic access was refused: show how to unblock it
+  const [blockedDevice, setBlockedDevice] = useState<"camera" | "microphone" | null>(null);
   const [micBusy, setMicBusy] = useState(false);
   const [camBusy, setCamBusy] = useState(false);
 
@@ -571,13 +823,21 @@ function Room({
   const camOpts = session.camId ? { deviceId: session.camId } : undefined;
   const micOpts = session.micId ? { deviceId: session.micId } : undefined;
 
+  // What the user *wants* on, so we can bring devices back after the phone
+  // suspends them (switching apps, locking the screen)
+  const micWanted = useRef(false);
+  const camWanted = useRef(false);
+
   async function setMic(on: boolean) {
     setMicBusy(true);
+    micWanted.current = on;
     try {
       await localParticipant.setMicrophoneEnabled(on, micOpts);
       setDeviceNotice("");
     } catch (err) {
-      setDeviceNotice(describeMediaError(err, "microphone"));
+      micWanted.current = false;
+      if (isPermissionError(err)) setBlockedDevice("microphone");
+      else setDeviceNotice(describeMediaError(err, "microphone"));
     } finally {
       setMicBusy(false);
     }
@@ -585,15 +845,48 @@ function Room({
 
   async function setCam(on: boolean) {
     setCamBusy(true);
+    camWanted.current = on;
     try {
       await localParticipant.setCameraEnabled(on, camOpts);
       setDeviceNotice("");
     } catch (err) {
-      setDeviceNotice(describeMediaError(err, "camera"));
+      camWanted.current = false;
+      if (isPermissionError(err)) setBlockedDevice("camera");
+      else setDeviceNotice(describeMediaError(err, "camera"));
     } finally {
       setCamBusy(false);
     }
   }
+
+  // Coming back to the tab/app: restart any camera/mic the OS stopped meanwhile
+  useEffect(() => {
+    const revive = async (source: Track.Source, wanted: boolean, kind: "camera" | "microphone") => {
+      if (!wanted) return;
+      const track = localParticipant.getTrackPublication(source)?.track;
+      const dead = !track || track.mediaStreamTrack?.readyState === "ended";
+      if (!dead) return;
+      try {
+        if (track && "restartTrack" in track) await (track as { restartTrack: () => Promise<void> }).restartTrack();
+        else if (source === Track.Source.Camera) await localParticipant.setCameraEnabled(true, camOpts);
+        else await localParticipant.setMicrophoneEnabled(true, micOpts);
+      } catch (err) {
+        setDeviceNotice(describeMediaError(err, kind));
+      }
+    };
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      void revive(Track.Source.Camera, camWanted.current, "camera");
+      void revive(Track.Source.Microphone, micWanted.current, "microphone");
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("pageshow", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("pageshow", onVisible);
+    };
+    // camOpts/micOpts are fixed for the session
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localParticipant]);
 
   // Once connected: start the devices chosen on the pre-join screen and share the avatar
   const started = useRef(false);
@@ -628,6 +921,53 @@ function Room({
   const [toast, setToast] = useState("");
   const [copied, setCopied] = useState(false);
 
+  /* ---- raised hands: tell everyone who raised theirs ---- */
+  useEffect(() => {
+    const onAttrs = (changed: Record<string, string>, p: Participant) => {
+      if (!("hand" in changed) || !changed.hand || p.isLocal) return;
+      setToast(`✋ ${p.name || "Someone"} raised their hand`);
+    };
+    room.on(RoomEvent.ParticipantAttributesChanged, onAttrs);
+    return () => {
+      room.off(RoomEvent.ParticipantAttributesChanged, onAttrs);
+    };
+  }, [room]);
+
+  /* ---- waiting room (host only) ---- */
+  const hostMeeting = useMeeting(roomId);
+  const isHost = !!hostMeeting && !!user && hostMeeting.hostId === user.id;
+  const [requests, setRequests] = useState<JoinRequest[]>([]);
+  const knownRequests = useRef(new Set<string>());
+  useEffect(() => {
+    if (!isHost) return;
+    let alive = true;
+    const load = () =>
+      listPendingRequests(roomId)
+        .then((list) => {
+          if (!alive) return;
+          const fresh = list.filter((r) => !knownRequests.current.has(r.id));
+          fresh.forEach((r) => knownRequests.current.add(r.id));
+          if (fresh.length === 1) setToast(`${fresh[0].name} wants to join`);
+          else if (fresh.length > 1) setToast(`${fresh.length} people want to join`);
+          setRequests(list);
+        })
+        .catch(() => {});
+    load();
+    const stopWatching = watchJoinRequests(roomId, load);
+    const poll = setInterval(load, 5000); // in case a realtime event is missed
+    return () => {
+      alive = false;
+      stopWatching();
+      clearInterval(poll);
+    };
+  }, [isHost, roomId]);
+
+  async function decide(ids: string[], status: "admitted" | "denied") {
+    setRequests((list) => list.filter((r) => !ids.includes(r.id)));
+    const res = await decideJoinRequests(ids, status);
+    if (!res.ok) setToast(`Couldn't update: ${res.error}`);
+  }
+
   /* ---- attendance for the History page (signed-in hosts/invitees only) ---- */
   const meetingId = meeting?.id;
   const userId = user?.id;
@@ -642,8 +982,11 @@ function Room({
     });
     const onUnload = () => attendanceId && void leaveMeeting(attendanceId);
     window.addEventListener("pagehide", onUnload);
+    // Keep "present until" fresh, in case the browser closes without a goodbye
+    const heartbeat = setInterval(() => attendanceId && void touchAttendance(attendanceId), 30_000);
     return () => {
       left = true;
+      clearInterval(heartbeat);
       window.removeEventListener("pagehide", onUnload);
       if (attendanceId) void leaveMeeting(attendanceId);
     };
@@ -704,12 +1047,52 @@ function Room({
     });
   }
 
-  /* ---- media toggles ---- */
+  /* ---- screen sharing ---- */
   const share = useTrackToggle({
     source: Track.Source.ScreenShare,
     captureOptions: { audio: true, selfBrowserSurface: "exclude" },
     onDeviceError: () => {}, // picker dismissed
   });
+  // Phones' browsers can't share the screen (and can't record the tab either)
+  const [canCaptureScreen] = useState(
+    () =>
+      typeof navigator.mediaDevices?.getDisplayMedia === "function" &&
+      !/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent),
+  );
+  const stoppingShare = useRef(false);
+  // Starting a share asks first (our dialog, then the browser's picker);
+  // stopping is immediate
+  const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  function toggleShare() {
+    if (share.enabled) {
+      stoppingShare.current = true;
+      void share.toggle(false);
+      return;
+    }
+    setShareDialogOpen(true);
+  }
+  function startShare({ audio }: { audio: boolean }) {
+    setShareDialogOpen(false);
+    stoppingShare.current = false;
+    // forceState + capture options (with or without sound)
+    void (share.toggle as (force?: boolean, opts?: object) => Promise<unknown>)(true, {
+      audio,
+      selfBrowserSurface: "exclude",
+    });
+  }
+  // If sharing ends without the user clicking Stop (the OS ended it, the
+  // browser's own "Stop sharing" bar, the app went to the background…), say so
+  useEffect(() => {
+    const onUnpublished = (pub: LocalTrackPublication) => {
+      if (pub.source !== Track.Source.ScreenShare) return;
+      if (!stoppingShare.current) setToast("Screen sharing stopped.");
+      stoppingShare.current = false;
+    };
+    localParticipant.on(ParticipantEvent.LocalTrackUnpublished, onUnpublished);
+    return () => {
+      localParticipant.off(ParticipantEvent.LocalTrackUnpublished, onUnpublished);
+    };
+  }, [localParticipant]);
 
   /* ---- recording ---- */
   const recorder = useTabRecorder({
@@ -747,7 +1130,11 @@ function Room({
     room.disconnect();
   }
 
-  const raisedCount = participants.filter((p) => p.attributes?.hand).length;
+  // Raised hands, in the order they went up
+  const raised = participants
+    .filter((p) => p.attributes?.hand)
+    .sort((a, b) => Number(a.attributes.hand) - Number(b.attributes.hand));
+  const handLabel = (p: Participant) => (p.isLocal ? "You" : (p.name || "Guest").split(" ")[0]);
 
   return (
     <div className="flex h-full w-full flex-col bg-ink text-paper">
@@ -760,11 +1147,15 @@ function Room({
           <div className="min-w-0">
             <p className="truncate font-medium">{meeting?.title ?? "MeetHub meeting"}</p>
             <p className="text-xs text-paper/60">
-              {connection === ConnectionState.Connected
-                ? `${participants.length} in call`
-                : connection === ConnectionState.Reconnecting
-                  ? "Reconnecting…"
-                  : "Connecting…"}
+              {connection === ConnectionState.Connected ? (
+                <>
+                  {participants.length} in call · <CallClock participants={participants} meeting={meeting} />
+                </>
+              ) : connection === ConnectionState.Reconnecting ? (
+                "Reconnecting…"
+              ) : (
+                "Connecting…"
+              )}
             </p>
           </div>
         </div>
@@ -778,10 +1169,19 @@ function Room({
               <span className="h-2 w-2 animate-pulse rounded-full bg-ink" /> {recorders[0].name || "Someone"} is recording
             </span>
           ) : null}
-          {raisedCount > 0 && (
-            <span className="chip bg-lime text-ink">
-              <Hand size={12} /> {raisedCount}
-            </span>
+          {raised.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setPanel("people")}
+              className="chip max-w-[10rem] bg-lime text-ink"
+              title={`Hands raised: ${raised.map((p) => (p.isLocal ? "You" : p.name || "Guest")).join(", ")}`}
+            >
+              <Hand size={12} className="shrink-0" />
+              <span className="truncate">
+                {handLabel(raised[0])}
+                {raised.length > 1 && ` +${raised.length - 1}`}
+              </span>
+            </button>
           )}
           <button onClick={copyLink} className="pill bg-paper/10 text-paper hover:bg-paper/20">
             {copied ? <Check size={13} /> : <Link2 size={13} />}
@@ -814,7 +1214,7 @@ function Room({
                   </div>
                 )}
               </div>
-              <div className="flex h-28 shrink-0 gap-2 overflow-x-auto">
+              <div className="scrollbar-thin flex h-28 shrink-0 gap-2 overflow-x-auto overflow-y-hidden pb-1">
                 {cameras.map((t) => (
                   <div key={t.participant.identity} className="h-full w-44 shrink-0">
                     <Tile trackRef={t} compact />
@@ -823,9 +1223,12 @@ function Room({
               </div>
             </>
           ) : (
-            <div className={`grid min-h-0 flex-1 auto-rows-fr gap-3 overflow-y-auto ${gridCols(cameras.length)}`}>
+            // Wrapping rows (not a CSS grid) so a part-filled last row is centred
+            <div className="flex min-h-0 flex-1 flex-wrap content-stretch justify-center gap-3 overflow-y-auto">
               {cameras.map((t) => (
-                <Tile key={t.participant.identity} trackRef={t} />
+                <div key={t.participant.identity} className={`min-h-32 ${tileBasis(cameras.length)}`}>
+                  <Tile trackRef={t} />
+                </div>
               ))}
             </div>
           )}
@@ -845,9 +1248,26 @@ function Room({
           </div>
 
           {deviceNotice && (
-            <p className="absolute left-3 top-3 z-10 max-w-[80%] rounded-full bg-ink/80 px-3 py-1.5 text-xs text-paper">
-              {deviceNotice}
+            <p className="absolute left-3 top-3 z-10 flex max-w-[85%] items-start gap-2 rounded-2xl bg-ink/90 py-1.5 pl-3 pr-1.5 text-xs text-paper shadow-lg">
+              <span className="py-0.5">{deviceNotice}</span>
+              <button
+                type="button"
+                onClick={() => setDeviceNotice("")}
+                aria-label="Dismiss"
+                className="shrink-0 rounded-full p-0.5 text-paper/70 hover:bg-paper/10 hover:text-paper"
+              >
+                <X size={14} />
+              </button>
             </p>
+          )}
+
+          {/* Host: people in the waiting room */}
+          {isHost && requests.length > 0 && (
+            <WaitingRoomCard
+              requests={requests}
+              onAdmit={(ids) => decide(ids, "admitted")}
+              onDeny={(ids) => decide(ids, "denied")}
+            />
           )}
 
           {connection !== ConnectionState.Connected && (
@@ -891,46 +1311,98 @@ function Room({
       </div>
 
       {/* Controls */}
-      <footer className="flex flex-wrap items-center justify-center gap-2 px-4 pb-5 pt-1">
+      <footer className="flex items-center justify-center gap-2 px-3 pt-1 pb-[max(1.25rem,env(safe-area-inset-bottom))]">
         <Ctrl label={isMicrophoneEnabled ? "Mute" : "Unmute"} off={!isMicrophoneEnabled} onClick={() => setMic(!isMicrophoneEnabled)} disabled={micBusy}>
           {isMicrophoneEnabled ? <Mic size={18} /> : <MicOff size={18} />}
         </Ctrl>
         <Ctrl label={isCameraEnabled ? "Turn camera off" : "Turn camera on"} off={!isCameraEnabled} onClick={() => setCam(!isCameraEnabled)} disabled={camBusy}>
           {isCameraEnabled ? <Video size={18} /> : <VideoOff size={18} />}
         </Ctrl>
-        <Ctrl label={share.enabled ? "Stop presenting" : "Share screen"} active={share.enabled} onClick={() => share.toggle()} disabled={share.pending}>
-          <MonitorUp size={18} />
-        </Ctrl>
         <ReactionPicker onPick={react} />
-        <Ctrl label={myHand ? "Lower hand" : "Raise hand"} active={!!myHand} onClick={toggleHand}>
-          <Hand size={18} />
-        </Ctrl>
-        <Ctrl
-          label={recorder.recording ? "Stop recording" : "Record"}
-          active={recorder.recording}
-          activeClass="bg-clay text-ink"
-          onClick={recorder.recording ? recorder.stop : recorder.start}
-        >
-          {recorder.recording ? <Square size={16} fill="currentColor" /> : <Circle size={18} />}
-        </Ctrl>
-        <Ctrl label="Chat" active={panel === "chat"} onClick={() => setPanel(panel === "chat" ? null : "chat")}>
-          <MessageSquare size={18} />
-          {unread > 0 && (
-            <span className="absolute -right-0.5 -top-0.5 flex h-5 min-w-5 items-center justify-center rounded-full bg-clay px-1 text-[10px] font-bold text-ink">
-              {unread}
-            </span>
+
+        {/* Wider screens: every control in the bar */}
+        <div className="hidden sm:contents">
+          {canCaptureScreen && (
+            <Ctrl label={share.enabled ? "Stop presenting" : "Share screen"} active={share.enabled} onClick={toggleShare} disabled={share.pending}>
+              <MonitorUp size={18} />
+            </Ctrl>
           )}
-        </Ctrl>
-        <Ctrl label="People" active={panel === "people"} onClick={() => setPanel(panel === "people" ? null : "people")}>
-          <Users size={18} />
-        </Ctrl>
+          <Ctrl label={myHand ? "Lower hand" : "Raise hand"} active={!!myHand} onClick={toggleHand}>
+            <Hand size={18} />
+          </Ctrl>
+          {canCaptureScreen && (
+            <Ctrl
+              label={recorder.recording ? "Stop recording" : "Record"}
+              active={recorder.recording}
+              activeClass="bg-clay text-ink"
+              onClick={recorder.recording ? recorder.stop : recorder.start}
+            >
+              {recorder.recording ? <Square size={16} fill="currentColor" /> : <Circle size={18} />}
+            </Ctrl>
+          )}
+          <Ctrl label="Chat" active={panel === "chat"} onClick={() => setPanel(panel === "chat" ? null : "chat")}>
+            <MessageSquare size={18} />
+            {unread > 0 && <Badge>{unread}</Badge>}
+          </Ctrl>
+          <Ctrl label="People" active={panel === "people"} onClick={() => setPanel(panel === "people" ? null : "people")}>
+            <Users size={18} />
+            {isHost && requests.length > 0 && <Badge>{requests.length}</Badge>}
+          </Ctrl>
+        </div>
+
+        {/* Phones: the rest lives in a "More" menu */}
+        <MoreMenu
+          badge={unread + (isHost ? requests.length : 0)}
+          items={[
+            ...(canCaptureScreen
+              ? [{ label: share.enabled ? "Stop presenting" : "Share screen", icon: <MonitorUp size={18} />, active: share.enabled, onSelect: toggleShare }]
+              : []),
+            { label: myHand ? "Lower hand" : "Raise hand", icon: <Hand size={18} />, active: !!myHand, onSelect: toggleHand },
+            ...(canCaptureScreen
+              ? [{
+                  label: recorder.recording ? "Stop recording" : "Record",
+                  icon: recorder.recording ? <Square size={16} fill="currentColor" /> : <Circle size={18} />,
+                  active: recorder.recording,
+                  onSelect: recorder.recording ? recorder.stop : recorder.start,
+                }]
+              : []),
+            { label: "Chat", icon: <MessageSquare size={18} />, active: panel === "chat", count: unread, onSelect: () => setPanel(panel === "chat" ? null : "chat") },
+            { label: "People", icon: <Users size={18} />, active: panel === "people", count: isHost ? requests.length : 0, onSelect: () => setPanel(panel === "people" ? null : "people") },
+          ]}
+        />
+
         <button
           onClick={leave}
-          className="ml-1 flex h-12 items-center gap-2 rounded-full bg-clay px-5 text-sm font-semibold text-ink transition-colors hover:bg-paper"
+          aria-label="Leave meeting"
+          className="ml-1 flex h-12 items-center gap-2 rounded-full bg-clay px-4 text-sm font-semibold text-ink transition-colors hover:bg-paper sm:px-5"
         >
           <PhoneOff size={16} /> <span className="hidden sm:inline">Leave</span>
         </button>
       </footer>
+
+      <ShareScreenDialog
+        open={shareDialogOpen}
+        onOpenChange={setShareDialogOpen}
+        viewers={participants
+          .filter((p) => !p.isLocal)
+          .map((p) => ({ id: p.identity, name: p.name || "Guest", avatar: parseAvatar(p.attributes?.avatar) }))}
+        onConfirm={startShare}
+      />
+
+      {blockedDevice && (
+        <DevicePermissionDialog
+          open
+          mode="blocked"
+          devices={blockedDevice}
+          onOpenChange={(o) => !o && setBlockedDevice(null)}
+          onAllow={() => {
+            const which = blockedDevice;
+            setBlockedDevice(null);
+            void (which === "camera" ? setCam(true) : setMic(true));
+          }}
+          onSkip={() => setBlockedDevice(null)}
+        />
+      )}
 
       {toast && (
         <div role="status" className="fixed bottom-24 left-1/2 z-30 -translate-x-1/2 rounded-full bg-lime px-4 py-2 text-sm text-ink shadow-lg">
@@ -941,11 +1413,12 @@ function Room({
   );
 }
 
-function gridCols(n: number) {
-  if (n <= 1) return "grid-cols-1";
-  if (n <= 4) return "grid-cols-1 sm:grid-cols-2";
-  if (n <= 9) return "grid-cols-2 lg:grid-cols-3";
-  return "grid-cols-2 sm:grid-cols-3 lg:grid-cols-4";
+/** Tile width for n people: 1–4 columns depending on count and screen (gap is 0.75rem) */
+function tileBasis(n: number) {
+  if (n <= 1) return "basis-full";
+  if (n <= 4) return "basis-full sm:basis-[calc(50%-0.375rem)]";
+  if (n <= 9) return "basis-[calc(50%-0.375rem)] lg:basis-[calc(33.333%-0.5rem)]";
+  return "basis-[calc(50%-0.375rem)] sm:basis-[calc(33.333%-0.5rem)] lg:basis-[calc(25%-0.5625rem)]";
 }
 
 /* ------------------------------- Tiles -------------------------------- */
@@ -968,14 +1441,22 @@ function Tile({
 
   return (
     <div
-      className={`relative flex h-full min-h-32 items-center justify-center overflow-hidden rounded-[1.25rem] bg-paper/5 transition-shadow ${
+      className={`relative flex h-full items-center justify-center overflow-hidden rounded-[1.25rem] bg-paper/5 transition-shadow ${
+        compact ? "" : "min-h-32"
+      } ${
         speaking ? "ring-2 ring-lime" : ""
       }`}
     >
       {hasVideo ? (
         <VideoTrack trackRef={trackRef} className={`h-full w-full object-cover ${p.isLocal ? "-scale-x-100" : ""}`} />
       ) : (
-        <ProfileAvatar name={p.name || "Guest"} avatar={avatar} size={compact ? 44 : 96} />
+        // Centred in the space above the name label, and scaled with the tile,
+        // so it never runs into the label on small tiles
+        <div className="absolute inset-x-0 top-0 bottom-9 flex items-center justify-center">
+          <div className={`aspect-square ${compact ? "h-[70%]" : "h-[72%] max-h-24"}`}>
+            <ProfileAvatar name={p.name || "Guest"} avatar={avatar} size={96} className="!size-full" />
+          </div>
+        </div>
       )}
       <span className="absolute bottom-2 left-2 flex max-w-[85%] items-center gap-1.5 truncate rounded-full bg-ink/70 px-2.5 py-1 text-xs">
         {micMuted && <MicOff size={11} className="shrink-0 text-clay" />}
@@ -1021,6 +1502,167 @@ function Ctrl({
     >
       {children}
     </button>
+  );
+}
+
+/**
+ * How long the call has been going (since the earliest person still in it
+ * joined), plus the scheduled end — or how far over it is.
+ * Its own component so the 1-second tick doesn't re-render the whole room.
+ */
+function CallClock({ participants, meeting }: { participants: Participant[]; meeting: RoomInfo | null }) {
+  const now = useNow(1000);
+  // Ignore missing/bogus join times (e.g. 0 = 1970) rather than show a silly clock
+  const joined = participants
+    .map((p) => p.joinedAt?.getTime())
+    .filter((t): t is number => typeof t === "number" && t > now.getTime() - 86_400_000 && t <= now.getTime());
+  const started = joined.length ? Math.min(...joined) : now.getTime();
+  const elapsed = Math.max(0, (now.getTime() - started) / 1000);
+
+  let schedule: string | null = null;
+  if (meeting) {
+    const end = new Date(meeting.start).getTime() + meeting.duration * 60_000;
+    const overMin = Math.floor((now.getTime() - end) / 60_000);
+    schedule = overMin >= 1 ? `over by ${overMin} min` : `ends ${fmtTime(new Date(end))}`;
+  }
+
+  return (
+    <span title="Time since the call started">
+      <span className="tabular-nums">{fmtClock(elapsed)}</span>
+      {schedule && (
+        <span className={schedule.startsWith("over") ? "text-clay" : ""}> · {schedule}</span>
+      )}
+    </span>
+  );
+}
+
+/** Small count bubble on a control */
+function Badge({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="absolute -right-0.5 -top-0.5 flex h-5 min-w-5 items-center justify-center rounded-full bg-clay px-1 text-[10px] font-bold text-ink">
+      {children}
+    </span>
+  );
+}
+
+type MoreItem = {
+  label: string;
+  icon: React.ReactNode;
+  active?: boolean;
+  count?: number;
+  onSelect: () => void;
+};
+
+/** Phones: secondary controls in a pop-up list above the bar */
+function MoreMenu({ items, badge }: { items: MoreItem[]; badge: number }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: PointerEvent) => !ref.current?.contains(e.target as Node) && setOpen(false);
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [open]);
+
+  return (
+    <div ref={ref} className="relative sm:hidden">
+      <Ctrl label="More options" active={open} onClick={() => setOpen((o) => !o)}>
+        <Ellipsis size={18} />
+        {badge > 0 && !open && <Badge>{badge}</Badge>}
+      </Ctrl>
+      {open && (
+        <div
+          role="menu"
+          className="absolute bottom-14 left-1/2 z-30 flex w-56 -translate-x-1/2 flex-col gap-0.5 rounded-2xl bg-paper p-1.5 text-ink shadow-lg"
+        >
+          {items.map((it) => (
+            <button
+              key={it.label}
+              role="menuitem"
+              onClick={() => {
+                it.onSelect();
+                setOpen(false);
+              }}
+              className={`flex items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm ${
+                it.active ? "bg-ink text-paper" : "hover:bg-paper-deep"
+              }`}
+            >
+              {it.icon}
+              <span className="flex-1">{it.label}</span>
+              {!!it.count && (
+                <span className="rounded-full bg-clay px-2 py-0.5 text-[10px] font-bold text-ink">{it.count}</span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Host: who's waiting to be let in */
+function WaitingRoomCard({
+  requests,
+  onAdmit,
+  onDeny,
+}: {
+  requests: JoinRequest[];
+  onAdmit: (ids: string[]) => void;
+  onDeny: (ids: string[]) => void;
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  return (
+    <section
+      aria-label="Waiting room"
+      className="absolute right-3 top-3 z-20 w-[calc(100%-1.5rem)] max-w-sm overflow-hidden rounded-2xl bg-paper text-ink shadow-lg"
+    >
+      <div className="flex items-center justify-between gap-2 border-b border-line px-4 py-3">
+        <button
+          type="button"
+          onClick={() => setCollapsed((c) => !c)}
+          aria-expanded={!collapsed}
+          className="flex items-center gap-2 text-sm font-medium"
+        >
+          <span className="h-2 w-2 animate-pulse rounded-full bg-clay" />
+          {requests.length === 1 ? "1 person is waiting" : `${requests.length} people are waiting`}
+        </button>
+        {requests.length > 1 && (
+          <button
+            type="button"
+            onClick={() => onAdmit(requests.map((r) => r.id))}
+            className="pill bg-ink px-3 py-1.5 text-paper hover:bg-clay hover:text-ink"
+          >
+            Admit all
+          </button>
+        )}
+      </div>
+      {!collapsed && (
+        <ul className="max-h-64 overflow-y-auto">
+          {requests.map((r) => (
+            <li key={r.id} className="flex items-center gap-3 border-b border-line px-4 py-2.5 last:border-b-0">
+              <ProfileAvatar name={r.name} avatar={r.avatar} size={32} />
+              <span className="min-w-0 flex-1 truncate text-sm">{r.name}</span>
+              <button
+                type="button"
+                onClick={() => onDeny([r.id])}
+                aria-label={`Deny ${r.name}`}
+                title="Deny"
+                className="flex h-8 w-8 items-center justify-center rounded-full text-stone hover:bg-paper-deep hover:text-ink"
+              >
+                <X size={15} />
+              </button>
+              <button
+                type="button"
+                onClick={() => onAdmit([r.id])}
+                className="pill bg-lime px-3 py-1.5 text-ink hover:bg-ink hover:text-paper"
+              >
+                <Check size={13} /> Admit
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 
