@@ -21,6 +21,7 @@ import {
   useRecordings,
   type Recording,
 } from "@/lib/recordings";
+import { meetingHref } from "@/lib/meetingCode";
 import { dayLabel, fmtDuration, fmtTime, startOfDay } from "@/lib/format";
 
 type Filter = "all" | "attended" | "recorded";
@@ -196,7 +197,7 @@ export default function HistoryPage() {
                               <MessageSquare size={13} /> Chat ({chat.length})
                             </button>
                           )}
-                          <Link href={`/meet/${m.id}`} className="pill bg-paper text-ink hover:bg-lime">
+                          <Link href={meetingHref(m)} className="pill bg-paper text-ink hover:bg-lime">
                             <Video size={13} /> Reopen room
                           </Link>
                         </div>

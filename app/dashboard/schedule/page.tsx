@@ -125,8 +125,8 @@ export default function SchedulePage() {
             <p className="mt-3 text-sm text-stone">Invites: {created.invitees.join(", ")}</p>
           )}
           <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-line pt-4">
-            <span className="min-w-0 flex-1 truncate text-sm text-stone">{meetingUrl(created.id)}</span>
-            <CopyButton text={meetingUrl(created.id)} label="Copy meeting link" />
+            <span className="min-w-0 flex-1 truncate text-sm text-stone">{meetingUrl(created)}</span>
+            <CopyButton text={meetingUrl(created)} label="Copy meeting link" />
           </div>
         </div>
         <p className="text-sm text-stone">
@@ -144,7 +144,7 @@ export default function SchedulePage() {
               description: created.description,
               start: s,
               duration: created.duration,
-              url: meetingUrl(created.id),
+              url: meetingUrl(created),
             }}
           />
           <button onClick={reset} className="pill bg-white px-5 py-3 text-ink hover:bg-lime">

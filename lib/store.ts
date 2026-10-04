@@ -44,6 +44,8 @@ export type Meeting = {
   status: "scheduled" | "cancelled";
   /** who skips the waiting room — see migration 0004 */
   access: MeetingAccess;
+  /** short code like "abc-def-ghi" (migration 0005); absent before that */
+  code?: string;
   createdAt: string;
 };
 
@@ -97,6 +99,7 @@ type MeetingRow = {
   status: "scheduled" | "cancelled";
   /** missing until migration 0004 is run */
   access?: MeetingAccess;
+  code?: string | null;
   created_at: string;
 };
 
@@ -143,6 +146,7 @@ const toMeeting = (r: MeetingRow): Meeting => ({
     : undefined,
   status: r.status,
   access: r.access ?? "anyone_with_link",
+  code: r.code ?? undefined,
   createdAt: r.created_at,
 });
 
@@ -532,7 +536,20 @@ export type PublicMeeting = {
   status: "scheduled" | "cancelled";
   hostName: string;
   access: MeetingAccess;
+  code?: string;
 };
+
+/**
+ * Find a meeting by its short code ("abc-def-ghi"). Returns the meeting id,
+ * or null if there's no such meeting. `unavailable` = codes aren't set up yet.
+ */
+export async function resolveMeetingCode(
+  code: string,
+): Promise<{ id: string | null; unavailable?: boolean }> {
+  const { data, error } = await supabase().rpc("get_meeting_id_by_code", { p_code: code });
+  if (error) return { id: null, unavailable: /could not find the function/i.test(error.message) };
+  return { id: (data as string | null) ?? null };
+}
 
 /** Title/time for the meeting room — anyone with the link can see this */
 export async function getMeetingPublic(id: string): Promise<PublicMeeting | null> {
@@ -546,6 +563,7 @@ export async function getMeetingPublic(id: string): Promise<PublicMeeting | null
     status: "scheduled" | "cancelled";
     host_name: string;
     access?: MeetingAccess;
+    code?: string | null;
   }[] | null)?.[0];
   return row
     ? {
@@ -556,6 +574,7 @@ export async function getMeetingPublic(id: string): Promise<PublicMeeting | null
         status: row.status,
         hostName: row.host_name,
         access: row.access ?? "anyone_with_link",
+        code: row.code ?? undefined,
       }
     : null;
 }

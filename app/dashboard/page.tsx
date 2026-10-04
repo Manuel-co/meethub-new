@@ -7,6 +7,8 @@ import { ArrowUpRight, CalendarPlus, Clock, Link2, Loader2, Mail, Users, Video, 
 import Avatar from "@/components/app/Avatar";
 import AddToCalendar from "@/components/app/AddToCalendar";
 import { meetingUrl } from "@/lib/calendar";
+import { meetingHref } from "@/lib/meetingCode";
+import JoinWithCode from "@/components/app/JoinWithCode";
 import CopyButton from "@/components/app/CopyButton";
 import { useNow } from "@/components/app/useNow";
 import { ACCESS_OPTIONS } from "@/components/app/AccessPicker";
@@ -46,7 +48,7 @@ export default function DashboardPage() {
       setStartError(`Couldn't start a meeting: ${res.error}`);
       return;
     }
-    router.push(`/meet/${res.data.id}`);
+    router.push(meetingHref(res.data));
   }
 
   const { upcoming, past, thisWeek, booked, groups } = useMemo(() => {
@@ -112,6 +114,11 @@ export default function DashboardPage() {
           {startError}
         </p>
       )}
+
+      {/* Someone sent you a code? */}
+      <div className="-mt-4 w-full max-w-md">
+        <JoinWithCode />
+      </div>
 
       {/* Stats */}
       <section className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -207,7 +214,7 @@ export default function DashboardPage() {
                 </p>
                 <Attendees m={next} dark />
                 <Link
-                  href={`/meet/${next.id}`}
+                  href={meetingHref(next)}
                   className="pill w-fit bg-lime px-5 py-3 text-ink hover:bg-paper"
                 >
                   <Video size={14} /> Join room
@@ -350,11 +357,11 @@ function MeetingRow({
               description: m.description,
               start,
               duration: m.duration,
-              url: meetingUrl(m.id),
+              url: meetingUrl(m),
             }}
           />
           <Link
-            href={`/meet/${m.id}`}
+            href={meetingHref(m)}
             className={`pill ${live ? "bg-clay text-ink hover:bg-ink hover:text-paper" : "bg-paper text-ink hover:bg-lime"}`}
           >
             <Video size={13} /> Join

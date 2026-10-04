@@ -37,6 +37,7 @@ import {
   Circle,
   Ellipsis,
   Lock,
+  PenLine,
   Hand,
   Link2,
   Loader2,
@@ -71,6 +72,11 @@ import {
 } from "@/lib/media";
 import DevicePermissionDialog, { type DeviceAsk } from "@/components/app/DevicePermissionDialog";
 import ShareScreenDialog from "@/components/app/ShareScreenDialog";
+import Whiteboard from "@/components/app/Whiteboard";
+import JoinWithCode from "@/components/app/JoinWithCode";
+import { meetingHref, normalizeCode } from "@/lib/meetingCode";
+import { meetingUrl } from "@/lib/calendar";
+import { useWhiteboardSync } from "@/lib/whiteboard";
 import SelectField from "@/components/app/SelectField";
 import { useNow } from "@/components/app/useNow";
 import {
@@ -81,6 +87,7 @@ import {
   joinRequestStatus,
   listPendingRequests,
   requestToJoin,
+  resolveMeetingCode,
   touchAttendance,
   watchJoinRequests,
   type JoinRequest,
@@ -115,10 +122,54 @@ type Session = {
 type WaitingRequest = { id: string; secret: string; name: string };
 
 /** What the room needs to know about a scheduled meeting */
-type RoomInfo = Pick<Meeting, "id" | "title" | "start" | "duration" | "status" | "access">;
+type RoomInfo = Pick<Meeting, "id" | "title" | "start" | "duration" | "status" | "access" | "code">;
 
+/**
+ * /meet/<id>, /meet/abc-def-ghi, or the short /abc-def-ghi (rewritten here in
+ * next.config.ts). A code is looked up first; then it's the same room.
+ */
 export default function MeetPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
+  const { id: raw } = use(params);
+  const code = normalizeCode(decodeURIComponent(raw));
+  const [resolved, setResolved] = useState<{ id: string | null; unavailable?: boolean } | null>(
+    code ? null : { id: raw },
+  );
+
+  useEffect(() => {
+    if (!code) return;
+    let cancelled = false;
+    resolveMeetingCode(code)
+      .then((r) => !cancelled && setResolved(r))
+      .catch(() => !cancelled && setResolved({ id: null }));
+    return () => {
+      cancelled = true;
+    };
+  }, [code]);
+
+  if (!resolved) return <Center><Loader2 className="animate-spin" /></Center>;
+
+  if (!resolved.id) {
+    return (
+      <Center>
+        <p className="display text-4xl">
+          {resolved.unavailable ? "Meeting codes aren't set up yet." : "No meeting with that code."}
+        </p>
+        <p className="max-w-md text-sm text-paper/70">
+          {resolved.unavailable
+            ? "Run supabase/migrations/0005_meeting_codes.sql in the Supabase SQL editor."
+            : <>Check <span className="font-medium text-paper">{code}</span> and try again.</>}
+        </p>
+        <div className="w-full max-w-sm">
+          <JoinWithCode tone="dark" />
+        </div>
+      </Center>
+    );
+  }
+
+  return <MeetingRoomPage id={resolved.id} />;
+}
+
+function MeetingRoomPage({ id }: { id: string }) {
   const hydrated = useHydrated();
   // Hosts/invitees already have the meeting cached; everyone else (guests)
   // gets the public title/time by id. Ad-hoc rooms have no record at all.
@@ -683,7 +734,7 @@ function PreJoin({
               <p className="text-paper/80">{notInvited.message}</p>
               {!notInvited.signedIn && (
                 <Link
-                  href={`/login?next=${encodeURIComponent(`/meet/${roomId}`)}`}
+                  href={`/login?next=${encodeURIComponent(meetingHref({ id: roomId, code: meeting?.code }))}`}
                   className="pill bg-paper text-ink hover:bg-lime"
                 >
                   Log in
@@ -1047,6 +1098,19 @@ function Room({
     });
   }
 
+  /* ---- whiteboard (shared, synced over LiveKit) ---- */
+  const [boardOpen, setBoardOpen] = useState(false);
+  const board = useWhiteboardSync({
+    room,
+    connected: connection === ConnectionState.Connected,
+    onOpenedBy: (name) => setToast(`✏️ ${name} opened the whiteboard`),
+  });
+  function toggleBoard() {
+    if (boardOpen) return setBoardOpen(false);
+    setBoardOpen(true);
+    board.announceOpened(localParticipant.name || "Someone");
+  }
+
   /* ---- screen sharing ---- */
   const share = useTrackToggle({
     source: Track.Source.ScreenShare,
@@ -1114,13 +1178,16 @@ function Room({
     return () => clearTimeout(t);
   }, [toast]);
 
+  // Always share the short form (/abc-def-ghi) when the meeting has a code
+  const inviteLink = meetingUrl({ id: roomId, code: meeting?.code });
+
   async function copyLink() {
     try {
-      await navigator.clipboard.writeText(window.location.href);
+      await navigator.clipboard.writeText(inviteLink);
       setCopied(true);
       setTimeout(() => setCopied(false), 1800);
     } catch {
-      window.prompt("Copy this link:", window.location.href);
+      window.prompt("Copy this link:", inviteLink);
     }
   }
 
@@ -1193,7 +1260,25 @@ function Room({
       <div className="relative flex min-h-0 flex-1 gap-3 px-3 pb-3 sm:px-4">
         {/* Stage */}
         <div className="relative flex min-w-0 flex-1 flex-col gap-3">
-          {stage ? (
+          {boardOpen ? (
+            <>
+              <div className="relative min-h-0 flex-1">
+                <Whiteboard
+                  initialElements={board.snapshot()}
+                  onLocalChange={board.publishLocal}
+                  setView={board.setView}
+                  onClose={() => setBoardOpen(false)}
+                />
+              </div>
+              <div className="scrollbar-thin flex h-28 shrink-0 gap-2 overflow-x-auto overflow-y-hidden pb-1">
+                {cameras.map((t) => (
+                  <div key={t.participant.identity} className="h-full w-44 shrink-0">
+                    <Tile trackRef={t} compact />
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : stage ? (
             <>
               <div className="relative min-h-0 flex-1 overflow-hidden rounded-[1.25rem] bg-black">
                 <VideoTrack trackRef={stage} className="h-full w-full object-contain" />
@@ -1327,6 +1412,9 @@ function Room({
               <MonitorUp size={18} />
             </Ctrl>
           )}
+          <Ctrl label={boardOpen ? "Close whiteboard" : "Whiteboard"} active={boardOpen} onClick={toggleBoard}>
+            <PenLine size={18} />
+          </Ctrl>
           <Ctrl label={myHand ? "Lower hand" : "Raise hand"} active={!!myHand} onClick={toggleHand}>
             <Hand size={18} />
           </Ctrl>
@@ -1357,6 +1445,7 @@ function Room({
             ...(canCaptureScreen
               ? [{ label: share.enabled ? "Stop presenting" : "Share screen", icon: <MonitorUp size={18} />, active: share.enabled, onSelect: toggleShare }]
               : []),
+            { label: boardOpen ? "Close whiteboard" : "Whiteboard", icon: <PenLine size={18} />, active: boardOpen, onSelect: toggleBoard },
             { label: myHand ? "Lower hand" : "Raise hand", icon: <Hand size={18} />, active: !!myHand, onSelect: toggleHand },
             ...(canCaptureScreen
               ? [{

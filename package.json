@@ -11,6 +11,7 @@
   "dependencies": {
     "@dicebear/collection": "^9.4.2",
     "@dicebear/core": "^9.4.3",
+    "@excalidraw/excalidraw": "^0.18.1",
     "@livekit/components-react": "^2.9.24",
     "@supabase/supabase-js": "^2.117.2",
     "class-variance-authority": "^0.7.1",

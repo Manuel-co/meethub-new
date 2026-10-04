@@ -7,7 +7,8 @@ import Logo from "@/components/app/Logo";
 import ProfileAvatar from "@/components/app/ProfileAvatar";
 import AddToCalendar from "@/components/app/AddToCalendar";
 import { meetingUrl } from "@/lib/calendar";
-import { bookMeeting, getBusyTimes, getHost, type Host } from "@/lib/store";
+import { bookMeeting, getBusyTimes, getHost, getMeetingPublic, type Host } from "@/lib/store";
+import { meetingHref } from "@/lib/meetingCode";
 import { BOOKING_HORIZON_DAYS, getSlots, type Busy } from "@/lib/scheduling";
 import { addDays, fmtDay, fmtDuration, fmtMonth, fmtTime, isSameDay, startOfDay } from "@/lib/format";
 import { browserTimeZone } from "@/lib/tz";
@@ -80,7 +81,7 @@ function Shell({ children }: { children: React.ReactNode }) {
   );
 }
 
-type Booked = { id: string; title: string; start: Date; duration: number };
+type Booked = { id: string; code?: string; title: string; start: Date; duration: number };
 
 function Booker({ host }: { host: Host }) {
   const [today] = useState(() => startOfDay(new Date()));
@@ -178,7 +179,9 @@ function Booker({ host }: { host: Host }) {
       }
       return;
     }
-    setBooked({ id: res.data, title: host.bookingTitle, start: slot, duration });
+    // fetch the short code ("abc-def-ghi") for the link; fine without it
+    const info = await getMeetingPublic(res.data).catch(() => null);
+    setBooked({ id: res.data, code: info?.code, title: host.bookingTitle, start: slot, duration });
   }
 
   /* ---- Confirmation ---- */
@@ -198,7 +201,7 @@ function Booker({ host }: { host: Host }) {
           <p className="mt-1 text-sm text-stone">
             {fmtDay(booked.start)} · {fmtTime(booked.start)} · {fmtDuration(booked.duration)}
           </p>
-          <p className="mt-3 break-all text-xs text-stone">{meetingUrl(booked.id)}</p>
+          <p className="mt-3 break-all text-xs text-stone">{meetingUrl(booked)}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <AddToCalendar
@@ -209,10 +212,10 @@ function Booker({ host }: { host: Host }) {
               description: note.trim() || undefined,
               start: booked.start,
               duration: booked.duration,
-              url: meetingUrl(booked.id),
+              url: meetingUrl(booked),
             }}
           />
-          <Link href={`/meet/${booked.id}`} className="pill bg-paper px-5 py-3 text-ink hover:bg-lime">
+          <Link href={meetingHref(booked)} className="pill bg-paper px-5 py-3 text-ink hover:bg-lime">
             Meeting room
           </Link>
         </div>

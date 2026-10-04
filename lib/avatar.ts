@@ -90,17 +90,23 @@ export function saveAvatar(a: AvatarSpec) {
 // Drawing an SVG is cheap but not free; tiles re-render often
 const cache = new Map<string, string>();
 
-/** Image URL for any avatar spec */
-export function avatarSrc(a: AvatarSpec): string {
+/**
+ * Image URL for any avatar spec. `radius` 50 = circle (default), 0 = square.
+ * `background: false` leaves it transparent (just the drawing).
+ */
+export function avatarSrc(
+  a: AvatarSpec,
+  { radius = 50, background = true }: { radius?: number; background?: boolean } = {},
+): string {
   if (a.kind === "photo") return a.src;
-  const key = `${a.style}:${a.seed}`;
+  const key = `${a.style}:${a.seed}:${radius}:${background}`;
   let uri = cache.get(key);
   if (!uri) {
     // Each style has its own option types; we only pass shared options
     uri = createAvatar(AVATAR_STYLES[a.style].style as unknown as Style<object>, {
       seed: a.seed,
-      backgroundColor: BACKGROUNDS,
-      radius: 50,
+      backgroundColor: background ? BACKGROUNDS : ["transparent"],
+      radius,
     }).toDataUri();
     if (cache.size > 200) cache.clear();
     cache.set(key, uri);

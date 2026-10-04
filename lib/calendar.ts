@@ -1,5 +1,6 @@
 // "Add to calendar" links and .ics files. No accounts or services needed:
 // Google/Outlook take a pre-filled URL, everything else imports the .ics file.
+import { hrefForPath, meetingHref } from "./meetingCode";
 
 export type CalendarEvent = {
   id: string;
@@ -87,4 +88,6 @@ export function downloadIcs(e: CalendarEvent) {
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
-export const meetingUrl = (id: string) => `${window.location.origin}/meet/${id}`;
+/** Shareable link for a meeting — e.g. https://site/abc-def-ghi when it has a code */
+export const meetingUrl = (m: string | { id: string; code?: string | null }) =>
+  `${window.location.origin}${typeof m === "string" ? hrefForPath(m) : meetingHref(m)}`;
