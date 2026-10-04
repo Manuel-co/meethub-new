@@ -275,11 +275,76 @@
   animation: rise 3s ease-out forwards;
 }
 
+/* Someone talking: rings spreading out from their avatar, and bouncing bars */
+@keyframes voice-ring {
+  0% { transform: scale(1); opacity: 0.85; }
+  100% { transform: scale(1.45); opacity: 0; }
+}
+
+@utility animate-voice-ring {
+  animation: voice-ring 1.4s ease-out infinite;
+}
+
+@keyframes voice-bar {
+  0%, 100% { transform: scaleY(0.35); }
+  50% { transform: scaleY(1); }
+}
+
+@utility animate-voice-bar {
+  animation: voice-bar 0.8s ease-in-out infinite;
+}
+
+/* Loaders: three colour blocks hopping in turn (like the hero's tiles) */
+@keyframes hop {
+  0%, 60%, 100% { transform: translateY(0) rotate(0deg); }
+  30% { transform: translateY(-9px) rotate(-8deg); }
+}
+
+@utility animate-hop {
+  animation: hop 1.1s ease-in-out infinite;
+}
+
+/* Skeleton placeholders: a soft light sweeping across */
+@keyframes shimmer {
+  from { background-position: 150% 0; }
+  to { background-position: -50% 0; }
+}
+
+@utility skeleton {
+  border-radius: 0.75rem;
+  background-color: var(--color-paper-deep);
+  background-image: linear-gradient(
+    100deg,
+    transparent 30%,
+    color-mix(in oklab, white 55%, transparent) 50%,
+    transparent 70%
+  );
+  background-size: 200% 100%;
+  background-repeat: no-repeat;
+  animation: shimmer 1.6s ease-in-out infinite;
+}
+
+/* Top-of-page navigation bar: creeps towards the end, then finishes */
+@keyframes nav-progress {
+  0% { transform: scaleX(0); }
+  20% { transform: scaleX(0.35); }
+  60% { transform: scaleX(0.7); }
+  100% { transform: scaleX(0.92); }
+}
+
+@utility animate-nav-progress {
+  animation: nav-progress 8s cubic-bezier(0.1, 0.7, 0.2, 1) forwards;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-float,
   .animate-drift-a,
   .animate-drift-b,
   .animate-drift-c { animation: none; }
+  .animate-hop { animation-duration: 2.4s; }
+  .skeleton { animation: none; }
+  .animate-voice-ring { animation: none; opacity: 0.35; transform: scale(1.12); }
+  .animate-voice-bar { animation: none; }
   .animate-rise { animation: rise 3s steps(1, end) forwards; }
   html { scroll-behavior: auto; }
 }

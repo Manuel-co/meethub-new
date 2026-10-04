@@ -30,6 +30,8 @@ update public.meetings set code = public.new_meeting_code() where code is null;
 alter table public.meetings
   alter column code set default public.new_meeting_code(),
   alter column code set not null;
+-- drop first so the file can be re-run safely
+alter table public.meetings drop constraint if exists meetings_code_format;
 alter table public.meetings
   add constraint meetings_code_format check (code ~ '^[a-z]{3}-[a-z]{3}-[a-z]{3}$');
 create unique index if not exists meetings_code_key on public.meetings (code);

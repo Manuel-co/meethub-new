@@ -74,6 +74,7 @@ import DevicePermissionDialog, { type DeviceAsk } from "@/components/app/DeviceP
 import ShareScreenDialog from "@/components/app/ShareScreenDialog";
 import Whiteboard from "@/components/app/Whiteboard";
 import JoinWithCode from "@/components/app/JoinWithCode";
+import { Blocks, PageLoader } from "@/components/app/Loader";
 import { meetingHref, normalizeCode } from "@/lib/meetingCode";
 import { meetingUrl } from "@/lib/calendar";
 import { useWhiteboardSync } from "@/lib/whiteboard";
@@ -94,6 +95,7 @@ import {
   leaveMeeting,
   saveChatMessage,
   updateProfile,
+  useAuth,
   useCurrentUser,
   useHydrated,
   useMeeting,
@@ -117,6 +119,30 @@ type Session = {
   micId?: string;
   avatar: AvatarSpec;
 };
+
+type LeaveReason = "user" | "empty";
+
+type Pass = { token?: string; url?: string; error?: string; code?: string; signedIn?: boolean };
+
+/** Ask the server for a meeting pass (signed-in users send their login so hosts/invitees skip the queue) */
+async function requestPass(roomId: string, name: string, req?: { id: string; secret: string }) {
+  const accessToken = await currentAccessToken();
+  const res = await fetch("/api/livekit/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+    },
+    body: JSON.stringify({ room: roomId, name, requestId: req?.id, requestSecret: req?.secret }),
+  });
+  const data: Pass = await res.json().catch(() => ({}));
+  return { ok: res.ok, data };
+}
+
+/** End the call after this long with nobody else in it (saves LiveKit minutes) */
+const ALONE_LIMIT_MIN = 5;
+/** …with a warning this long before */
+const ALONE_WARN_SEC = 60;
 
 /** A pending "let me in" request (the secret proves it's ours) */
 type WaitingRequest = { id: string; secret: string; name: string };
@@ -146,7 +172,7 @@ export default function MeetPage({ params }: { params: Promise<{ id: string }> }
     };
   }, [code]);
 
-  if (!resolved) return <Center><Loader2 className="animate-spin" /></Center>;
+  if (!resolved) return <PageLoader tone="dark" label="Finding the meeting" />;
 
   if (!resolved.id) {
     return (
@@ -186,13 +212,18 @@ function MeetingRoomPage({ id }: { id: string }) {
   }, [id]);
   const meeting: RoomInfo | null = cached ?? publicInfo;
   const [session, setSession] = useState<Session | null>(null);
-  const [left, setLeft] = useState(false);
+  // Why we left: the Leave button, or nobody else was here for too long
+  const [left, setLeft] = useState<LeaveReason | null>(null);
   const [failure, setFailure] = useState("");
   // Set when the user clicks Leave, so we can tell that apart from React
   // dev-mode remounts (which also disconnect "from the client")
-  const userLeft = useRef(false);
+  const userLeft = useRef<LeaveReason | null>(null);
+  // The signed-in host goes straight in, unless they ask to check devices first
+  const { ready, user } = useAuth();
+  const isHost = !!cached && !!user && cached.hostId === user.id;
+  const [checkDevices, setCheckDevices] = useState(false);
 
-  if (!hydrated) return <Center><Loader2 className="animate-spin" /></Center>;
+  if (!hydrated || !ready) return <PageLoader tone="dark" label="Opening the meeting" />;
 
   if (meeting?.status === "cancelled") {
     return (
@@ -218,9 +249,16 @@ function MeetingRoomPage({ id }: { id: string }) {
   if (left) {
     return (
       <Center>
-        <p className="display text-4xl">You left the meeting.</p>
+        <p className="display text-4xl">
+          {left === "empty" ? "The call ended because nobody else was here." : "You left the meeting."}
+        </p>
+        {left === "empty" && (
+          <p className="max-w-md text-sm text-paper/70">
+            Calls close after {ALONE_LIMIT_MIN} minutes on your own. Rejoin when the others are ready.
+          </p>
+        )}
         <div className="flex flex-wrap justify-center gap-2">
-          <button onClick={() => setLeft(false)} className="pill bg-paper px-5 py-3 text-ink hover:bg-lime">
+          <button onClick={() => setLeft(null)} className="pill bg-paper px-5 py-3 text-ink hover:bg-lime">
             Rejoin
           </button>
           <Link href="/dashboard/history" className="pill bg-paper/10 px-5 py-3 text-paper hover:bg-paper/20">
@@ -228,6 +266,19 @@ function MeetingRoomPage({ id }: { id: string }) {
           </Link>
         </div>
       </Center>
+    );
+  }
+
+  if (!session && isHost && user && !checkDevices) {
+    return (
+      <HostAutoJoin
+        roomId={id}
+        name={user.name}
+        avatar={user.avatar}
+        onJoin={setSession}
+        onFail={setFailure}
+        onCheckDevices={() => setCheckDevices(true)}
+      />
     );
   }
 
@@ -244,9 +295,9 @@ function MeetingRoomPage({ id }: { id: string }) {
       video={false}
       onDisconnected={(reason) => {
         if (userLeft.current) {
-          userLeft.current = false;
+          setLeft(userLeft.current);
+          userLeft.current = null;
           setSession(null);
-          setLeft(true);
           return;
         }
         // Our own cleanup (e.g. dev-mode remount) — the room reconnects by itself
@@ -286,10 +337,75 @@ function MeetingRoomPage({ id }: { id: string }) {
         roomId={id}
         meeting={meeting}
         session={session}
-        onLeave={() => (userLeft.current = true)}
+        onLeave={(reason) => (userLeft.current = reason)}
       />
       <RoomAudioRenderer />
     </LiveKitRoom>
+  );
+}
+
+/**
+ * The host, signed in: no form, no waiting room. Gets a pass straight away
+ * and joins with their profile name/avatar and the default camera and mic
+ * (any the browser has blocked start off; they can be turned on in the room).
+ */
+function HostAutoJoin({
+  roomId,
+  name,
+  avatar,
+  onJoin,
+  onFail,
+  onCheckDevices,
+}: {
+  roomId: string;
+  name: string;
+  avatar: AvatarSpec | null;
+  onJoin: (s: Session) => void;
+  onFail: (message: string) => void;
+  onCheckDevices: () => void;
+}) {
+  useEffect(() => {
+    let cancelled = false;
+    const displayName = name.trim() || "Host";
+    (async () => {
+      const [cam, mic] = await Promise.all([queryPermission("camera"), queryPermission("microphone")]);
+      const pass = await requestPass(roomId, displayName);
+      if (cancelled) return;
+      if (!pass.ok || !pass.data.token || !pass.data.url) {
+        onFail(pass.data.error ?? "Couldn't start the meeting.");
+        return;
+      }
+      try {
+        localStorage.setItem(NAME_KEY, displayName);
+      } catch {}
+      onJoin({
+        token: pass.data.token,
+        url: pass.data.url,
+        name: displayName,
+        video: cam !== "denied",
+        audio: mic !== "denied",
+        avatar: avatar ?? loadAvatar(),
+      });
+    })().catch((err) => !cancelled && onFail(err instanceof Error ? err.message : "Couldn't start the meeting."));
+    return () => {
+      cancelled = true;
+    };
+    // once per visit; the callbacks are fresh closures every render
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId]);
+
+  return (
+    <Center>
+      <Blocks size={12} />
+      <p className="text-sm text-paper/70">Starting your meeting…</p>
+      <button
+        type="button"
+        onClick={onCheckDevices}
+        className="text-xs text-paper/60 underline underline-offset-4 hover:text-paper"
+      >
+        Check camera and mic first
+      </button>
+    </Center>
   );
 }
 
@@ -481,23 +597,7 @@ function PreJoin({
     setWaiting(r);
   }
 
-  /** Ask the server for a meeting pass */
-  async function fetchPass(n: string, req?: WaitingRequest) {
-    const accessToken = await currentAccessToken();
-    const res = await fetch("/api/livekit/token", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
-      },
-      body: JSON.stringify({ room: roomId, name: n, requestId: req?.id, requestSecret: req?.secret }),
-    });
-    const data = await res.json().catch(() => ({}));
-    return { ok: res.ok, data } as {
-      ok: boolean;
-      data: { token?: string; url?: string; error?: string; code?: string };
-    };
-  }
+  const fetchPass = (n: string, req?: WaitingRequest) => requestPass(roomId, n, req);
 
   function enter(n: string, pass: { token?: string; url?: string }) {
     try {
@@ -533,7 +633,7 @@ function PreJoin({
         // No waiting room for invite-only meetings
         setNotInvited({
           message: pass.data.error ?? "This meeting is invite only.",
-          signedIn: Boolean((pass.data as { signedIn?: boolean }).signedIn),
+          signedIn: Boolean(pass.data.signedIn),
         });
         return;
       }
@@ -586,6 +686,20 @@ function PreJoin({
   }, [waiting?.id]);
 
   const start = meeting ? new Date(meeting.start) : null;
+  const loginHref = `/login?next=${encodeURIComponent(meetingHref({ id: roomId, code: meeting?.code }))}`;
+
+  // A scheduled meeting and nobody signed in: this could be the host on
+  // another device. Logging in brings them back here and straight into the call.
+  const hostLogin =
+    meeting && !user ? (
+      <p className="text-sm text-paper/60">
+        Hosting this meeting?{" "}
+        <Link href={loginHref} className="text-paper underline underline-offset-4 hover:text-lime">
+          Log in to start it
+        </Link>{" "}
+        without waiting.
+      </p>
+    ) : null;
 
   return (
     <div className="flex min-h-[100svh] w-full items-center justify-center bg-ink px-4 py-10 text-paper">
@@ -723,6 +837,7 @@ function PreJoin({
             >
               Cancel
             </button>
+            {hostLogin}
           </div>
         ) : (
         <form onSubmit={join} className="flex flex-col gap-6">
@@ -734,7 +849,7 @@ function PreJoin({
               <p className="text-paper/80">{notInvited.message}</p>
               {!notInvited.signedIn && (
                 <Link
-                  href={`/login?next=${encodeURIComponent(meetingHref({ id: roomId, code: meeting?.code }))}`}
+                  href={loginHref}
                   className="pill bg-paper text-ink hover:bg-lime"
                 >
                   Log in
@@ -802,6 +917,7 @@ function PreJoin({
           >
             {pending && <Loader2 size={14} className="animate-spin" />} Join now
           </button>
+          {!notInvited && hostLogin}
         </form>
         )}
       </div>
@@ -851,7 +967,7 @@ function Room({
   roomId: string;
   meeting: RoomInfo | null;
   session: Session;
-  onLeave: () => void;
+  onLeave: (reason: LeaveReason) => void;
 }) {
   const room = useRoomContext();
   const user = useCurrentUser();
@@ -1191,11 +1307,17 @@ function Room({
     }
   }
 
-  function leave() {
+  function leave(reason: LeaveReason = "user") {
     recorder.stop();
-    onLeave();
+    onLeave(reason);
     room.disconnect();
   }
+
+  // On your own (and nobody knocking): count down to closing the call.
+  // Bumping the key restarts the count when you choose to stay.
+  const alone =
+    connection === ConnectionState.Connected && participants.length <= 1 && requests.length === 0;
+  const [stayKey, setStayKey] = useState(0);
 
   // Raised hands, in the order they went up
   const raised = participants
@@ -1346,6 +1468,10 @@ function Room({
             </p>
           )}
 
+          {alone && (
+            <AloneGuard key={stayKey} onStay={() => setStayKey((k) => k + 1)} onEnd={() => leave("empty")} />
+          )}
+
           {/* Host: people in the waiting room */}
           {isHost && requests.length > 0 && (
             <WaitingRoomCard
@@ -1356,8 +1482,14 @@ function Room({
           )}
 
           {connection !== ConnectionState.Connected && (
-            <div className="absolute inset-0 flex items-center justify-center rounded-[1.25rem] bg-ink/70">
-              <Loader2 className="animate-spin" />
+            <div
+              role="status"
+              className="absolute inset-0 flex flex-col items-center justify-center gap-3 rounded-[1.25rem] bg-ink/70 text-sm text-paper/80"
+            >
+              <Blocks size={10} />
+              {connection === ConnectionState.Reconnecting || connection === ConnectionState.SignalReconnecting
+                ? "Connection dropped. Reconnecting…"
+                : "Connecting to the call…"}
             </div>
           )}
         </div>
@@ -1461,7 +1593,7 @@ function Room({
         />
 
         <button
-          onClick={leave}
+          onClick={() => leave()}
           aria-label="Leave meeting"
           className="ml-1 flex h-12 items-center gap-2 rounded-full bg-clay px-4 text-sm font-semibold text-ink transition-colors hover:bg-paper sm:px-5"
         >
@@ -1542,13 +1674,14 @@ function Tile({
         // Centred in the space above the name label, and scaled with the tile,
         // so it never runs into the label on small tiles
         <div className="absolute inset-x-0 top-0 bottom-9 flex items-center justify-center">
-          <div className={`aspect-square ${compact ? "h-[70%]" : "h-[72%] max-h-24"}`}>
-            <ProfileAvatar name={p.name || "Guest"} avatar={avatar} size={96} className="!size-full" />
+          <div className={`relative aspect-square ${compact ? "h-[70%]" : "h-[72%] max-h-24"}`}>
+            {speaking && <VoiceRings />}
+            <ProfileAvatar name={p.name || "Guest"} avatar={avatar} size={96} className="relative !size-full" />
           </div>
         </div>
       )}
       <span className="absolute bottom-2 left-2 flex max-w-[85%] items-center gap-1.5 truncate rounded-full bg-ink/70 px-2.5 py-1 text-xs">
-        {micMuted && <MicOff size={11} className="shrink-0 text-clay" />}
+        {micMuted ? <MicOff size={11} className="shrink-0 text-clay" /> : speaking && <VoiceBars />}
         <span className="truncate">{name}</span>
       </span>
       {hand && (
@@ -1557,6 +1690,31 @@ function Tile({
         </span>
       )}
     </div>
+  );
+}
+
+/** Two rings spreading out behind an avatar while that person talks */
+function VoiceRings() {
+  return (
+    <span aria-hidden className="absolute inset-0">
+      <span className="animate-voice-ring absolute inset-0 rounded-full bg-lime/70" />
+      <span className="animate-voice-ring absolute inset-0 rounded-full bg-lime/70" style={{ animationDelay: "0.7s" }} />
+    </span>
+  );
+}
+
+/** Three little bars bouncing next to the name of whoever's talking */
+function VoiceBars() {
+  return (
+    <span aria-label="Speaking" role="img" className="flex h-3 shrink-0 items-center gap-[2px]">
+      {[0, 0.2, 0.1].map((delay, i) => (
+        <span
+          key={i}
+          className="animate-voice-bar h-full w-[3px] origin-center rounded-full bg-lime"
+          style={{ animationDelay: `${delay}s` }}
+        />
+      ))}
+    </span>
   );
 }
 
@@ -1690,6 +1848,52 @@ function MoreMenu({ items, badge }: { items: MoreItem[]; badge: number }) {
 }
 
 /** Host: who's waiting to be let in */
+/**
+ * Mounted only while you're alone in the call. Quiet until the last minute,
+ * then warns with a countdown; ends the call at ALONE_LIMIT_MIN unless you stay.
+ */
+function AloneGuard({ onStay, onEnd }: { onStay: () => void; onEnd: () => void }) {
+  const [since] = useState(() => Date.now());
+  const now = useNow(1000);
+  const left = Math.max(0, Math.ceil((since + ALONE_LIMIT_MIN * 60_000 - now.getTime()) / 1000));
+
+  const ended = useRef(false);
+  useEffect(() => {
+    if (left > 0 || ended.current) return;
+    ended.current = true;
+    onEnd();
+  }, [left, onEnd]);
+
+  if (left > ALONE_WARN_SEC) return null;
+  return (
+    <section
+      role="alert"
+      className="absolute left-1/2 top-3 z-30 flex w-[calc(100%-1.5rem)] max-w-sm -translate-x-1/2 flex-col gap-3 rounded-2xl bg-paper p-4 text-ink shadow-lg"
+    >
+      <div className="flex items-start gap-3">
+        <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-lime">
+          <Users size={15} />
+        </span>
+        <div className="min-w-0">
+          <p className="text-sm font-medium">Nobody else is here</p>
+          <p className="text-sm text-stone">
+            This call ends in <span className="font-medium tabular-nums text-ink">{fmtClock(left)}</span> to save
+            time. Still waiting for someone?
+          </p>
+        </div>
+      </div>
+      <div className="flex justify-end gap-2">
+        <button type="button" onClick={onEnd} className="pill bg-white px-4 py-2 text-ink hover:bg-paper-deep">
+          End now
+        </button>
+        <button type="button" onClick={onStay} className="pill bg-ink px-4 py-2 text-paper hover:bg-clay hover:text-ink">
+          Keep waiting
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function WaitingRoomCard({
   requests,
   onAdmit,

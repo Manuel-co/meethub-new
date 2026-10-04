@@ -4,6 +4,7 @@ import Link from "next/link";
 import { use, useCallback, useEffect, useMemo, useState } from "react";
 import { ArrowLeft, Check, ChevronLeft, ChevronRight, Clock, Globe, Loader2 } from "lucide-react";
 import Logo from "@/components/app/Logo";
+import { Blocks, PageLoader, Skeleton } from "@/components/app/Loader";
 import ProfileAvatar from "@/components/app/ProfileAvatar";
 import AddToCalendar from "@/components/app/AddToCalendar";
 import { meetingUrl } from "@/lib/calendar";
@@ -43,7 +44,7 @@ export default function BookingPage({ params }: { params: Promise<{ username: st
   if (host === undefined) {
     return (
       <Shell>
-        <Loader2 className="animate-spin text-stone" />
+        <PageLoader label="Loading booking page" fullScreen={false} />
       </Shell>
     );
   }
@@ -368,9 +369,12 @@ function Booker({ host }: { host: Host }) {
 
           {/* ---- Slots ---- */}
           <section className="flex flex-col gap-4 p-6 sm:p-8 lg:col-span-3">
-            <h2 className="text-sm text-stone">{day ? fmtDay(day) : busy ? "Pick a day" : "Loading…"}</h2>
+            <h2 className="flex items-center gap-2 text-sm text-stone">
+              {day ? fmtDay(day) : busy ? "Pick a day" : <><Blocks size={6} /> Finding open times…</>}
+            </h2>
             {error && <p role="alert" className="rounded-lg bg-clay/20 px-3 py-2 text-sm">{error}</p>}
             <div className="flex max-h-[22rem] flex-col gap-2 overflow-y-auto pr-1">
+              {!busy && [0, 1, 2, 3, 4].map((i) => <Skeleton key={i} className="h-[46px] rounded-xl" />)}
               {slots.map((s) => (
                 <button
                   key={+s}

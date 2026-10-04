@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Hanken_Grotesk } from "next/font/google";
+import NavProgress from "@/components/app/NavProgress";
 import "./globals.css";
 
 const hanken = Hanken_Grotesk({
@@ -26,6 +27,7 @@ export default function RootLayout({
     >
       {/* browser extensions (e.g. ColorZilla) add attributes to <body> before React loads */}
       <body className="min-h-full flex flex-col bg-paper text-ink" suppressHydrationWarning>
+        <NavProgress />
         {children}
       </body>
     </html>

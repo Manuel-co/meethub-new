@@ -1,4 +1,4 @@
-import { AccessToken } from "livekit-server-sdk";
+import { AccessToken, RoomConfiguration } from "livekit-server-sdk";
 import { createClient } from "@supabase/supabase-js";
 
 // Issues a short-lived pass that lets one person join one LiveKit room.
@@ -110,6 +110,9 @@ export async function POST(request: Request) {
     name,
     ttl: "2h",
   });
+  // Applied when this join creates the room: close it if nobody shows up
+  // within 5 minutes, and 1 minute after the last person leaves
+  token.roomConfig = new RoomConfiguration({ emptyTimeout: 300, departureTimeout: 60 });
   token.addGrant({
     room,
     roomJoin: true,

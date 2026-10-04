@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { Download, MessageSquare, Play, Trash2, Video, X } from "lucide-react";
 import Avatar from "@/components/app/Avatar";
+import { MeetingListSkeleton, Skeleton } from "@/components/app/Loader";
 import { useNow } from "@/components/app/useNow";
 import {
   loadMeetingExtras,
@@ -38,6 +39,9 @@ export default function HistoryPage() {
     messages: [],
     attendance: [],
   });
+  const [extrasLoaded, setExtrasLoaded] = useState(false);
+  // First load only: later refreshes keep showing the list
+  const loading = !extrasLoaded || (recordings == null && !error);
 
   // Chat transcripts + attendance for meetings that have started
   const startedIds = meetings
@@ -48,7 +52,8 @@ export default function HistoryPage() {
     let cancelled = false;
     loadMeetingExtras(startedIds ? startedIds.split(",") : [])
       .then((x) => !cancelled && setExtras(x))
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => !cancelled && setExtrasLoaded(true));
     return () => {
       cancelled = true;
     };
@@ -116,8 +121,8 @@ export default function HistoryPage() {
       </header>
 
       <section className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        <Stat label="Past meetings" value={past.length} tone="bg-white" />
-        <Stat label="Attended" value={past.filter((m) => attendedBy(m)).length} tone="bg-sage" />
+        <Stat label="Past meetings" value={loading ? "–" : past.length} tone="bg-white" />
+        <Stat label="Attended" value={loading ? "–" : past.filter((m) => attendedBy(m)).length} tone="bg-sage" />
         <Stat
           label={`Recordings${totalSize ? ` · ${fmtBytes(totalSize)}` : ""}`}
           value={recordings?.length ?? "–"}
@@ -127,7 +132,12 @@ export default function HistoryPage() {
 
       {error && <p className="rounded-lg bg-clay/20 px-3 py-2 text-sm">{error}</p>}
 
-      {groups.length === 0 ? (
+      {loading ? (
+        <div role="status" aria-label="Loading past meetings" className="flex flex-col gap-2">
+          <Skeleton className="h-4 w-24" />
+          <MeetingListSkeleton rows={3} />
+        </div>
+      ) : groups.length === 0 ? (
         <div className="panel flex flex-col items-start gap-3 p-8">
           <p className="display text-2xl">
             {filter === "recorded" ? "No recordings yet." : "No past meetings yet."}

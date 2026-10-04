@@ -1,8 +1,8 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
-import { ArrowRight, Keyboard } from "lucide-react";
+import { useState, useTransition } from "react";
+import { ArrowRight, Keyboard, Loader2 } from "lucide-react";
 import { hrefForPath, meetingPathFromInput } from "@/lib/meetingCode";
 
 /** "Enter a code or link" → go to that meeting (its own rules decide who gets in) */
@@ -10,6 +10,8 @@ export default function JoinWithCode({ tone = "light" }: { tone?: "light" | "dar
   const router = useRouter();
   const [value, setValue] = useState("");
   const [error, setError] = useState("");
+  // stays true until the meeting page has loaded
+  const [pending, startTransition] = useTransition();
   const dark = tone === "dark";
 
   function submit(e: React.FormEvent) {
@@ -19,7 +21,7 @@ export default function JoinWithCode({ tone = "light" }: { tone?: "light" | "dar
       setError("That doesn't look like a meeting code. Codes look like abc-def-ghi.");
       return;
     }
-    router.push(hrefForPath(path));
+    startTransition(() => router.push(hrefForPath(path)));
   }
 
   return (
@@ -49,12 +51,13 @@ export default function JoinWithCode({ tone = "light" }: { tone?: "light" | "dar
         />
         <button
           type="submit"
-          disabled={!value.trim()}
+          disabled={!value.trim() || pending}
           className={`pill shrink-0 px-4 py-2.5 disabled:opacity-40 ${
             dark ? "bg-paper text-ink hover:bg-lime" : "bg-ink text-paper hover:bg-clay hover:text-ink"
           }`}
         >
-          Join <ArrowRight size={13} />
+          {pending ? "Joining" : "Join"}{" "}
+          {pending ? <Loader2 size={13} className="animate-spin" /> : <ArrowRight size={13} />}
         </button>
       </div>
       {error && (

@@ -2,7 +2,8 @@
 
 import dynamic from "next/dynamic";
 import { useEffect, useRef } from "react";
-import { Loader2, X } from "lucide-react";
+import { X } from "lucide-react";
+import { Blocks } from "@/components/app/Loader";
 import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
 import "@excalidraw/excalidraw/index.css";
 import type { BoardElement, BoardView } from "@/lib/whiteboard";
@@ -12,8 +13,8 @@ import type { BoardElement, BoardView } from "@/lib/whiteboard";
 const Excalidraw = dynamic(async () => (await import("@excalidraw/excalidraw")).Excalidraw, {
   ssr: false,
   loading: () => (
-    <div className="flex h-full items-center justify-center text-sm text-stone">
-      <Loader2 size={18} className="mr-2 animate-spin" /> Loading whiteboard…
+    <div role="status" className="flex h-full flex-col items-center justify-center gap-3 text-sm text-stone">
+      <Blocks size={10} /> Loading whiteboard…
     </div>
   ),
 });

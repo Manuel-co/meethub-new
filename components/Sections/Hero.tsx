@@ -1,7 +1,7 @@
 import Image from "next/image";
 import { ArrowDown } from "lucide-react";
 import { avatarSrc, type AvatarStyleId } from "@/lib/avatar";
-import JoinWithCode from "@/components/app/JoinWithCode";
+import HeroJoin from "@/components/app/HeroJoin";
 
 /**
  * What fills the image tiles: "avatars" (DiceBear, same as in meetings) or
@@ -133,10 +133,8 @@ export default function Hero() {
             See how it works
           </a>
         </div>
-        {/* Got a code from someone? Jump straight in */}
-        <div className="w-full max-w-sm">
-          <JoinWithCode />
-        </div>
+        {/* Your next meetings (signed in), or a code from someone: jump straight in */}
+        <HeroJoin />
       </div>
 
       {/* Scroll cue */}

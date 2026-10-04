@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
 import { CalendarPlus, Clock, ExternalLink, History, LayoutGrid, LogOut, Settings } from "lucide-react";
 import Logo from "@/components/app/Logo";
+import { DashboardPageSkeleton, Skeleton } from "@/components/app/Loader";
 import ProfileAvatar from "@/components/app/ProfileAvatar";
 import { logOut, useAuth } from "@/lib/store";
 
@@ -26,10 +27,22 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     if (ready && !user) router.replace("/login");
   }, [ready, user, router]);
 
+  // Checking who's signed in: show the shell's shape so nothing jumps
   if (!ready || !user) {
     return (
-      <div className="flex min-h-[100svh] w-full items-center justify-center text-sm text-stone">
-        Loading…
+      <div className="flex min-h-[100svh] w-full flex-col md:flex-row">
+        <aside className="flex flex-col gap-4 border-b border-line bg-paper px-4 py-4 md:sticky md:top-0 md:h-[100svh] md:w-64 md:shrink-0 md:gap-8 md:border-b-0 md:border-r md:px-5 md:py-6">
+          <Logo href="/dashboard" />
+          <div className="-mx-1 flex gap-1 overflow-hidden md:mx-0 md:flex-col">
+            {nav.map(({ href }) => (
+              <Skeleton key={href} className="h-9 w-28 shrink-0 rounded-full md:w-full" />
+            ))}
+          </div>
+          <Skeleton className="mt-auto hidden h-16 rounded-2xl md:block" />
+        </aside>
+        <main className="min-w-0 flex-1 px-4 py-8 sm:px-8 lg:px-12 lg:py-10">
+          <DashboardPageSkeleton />
+        </main>
       </div>
     );
   }
